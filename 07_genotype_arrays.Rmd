@@ -1,0 +1,271 @@
+---
+title: "Genotyping"
+output: html_notebook
+---
+
+Preprocessing and imputation is performed using the master scripts within the scripts directory.
+
+
+## R Code
+
+### Load all the needed libraries
+
+```{r}
+#code management
+library(here)
+
+#data processing and annotation
+library(minfi)
+library(SNPlocs.Hsapiens.dbSNP155.GRCh37)
+library(argyle)
+library(mgsub)
+library(LDlinkR)
+
+#plotting
+library(ggplot2)
+library(RColorBrewer)
+library(scales)
+library(factoextra)
+library(grid)
+library(ggrepel)
+```
+
+### Directories
+
+```{r}
+
+# Defined sub directories
+data_dir <- "rawdata"
+qced_dir <-"qced_data/"
+res_dir <- "results/"
+pca_dir <- "pca/"
+plink_dir <- "qced_data/merged/"
+imp_dir <- "results/imputation/plink/"
+log_dir <- "logs/"
+util_dir <- "utilities/"
+
+```
+
+### Source functions
+
+```{r}
+
+source("scripts/extra_functions.R")
+source(paste0(util_dir,"/R/pca_utility_functions.R"))
+source(paste0(util_dir,"/R/genotyping.R"))
+
+```
+
+### Read in the data
+
+#### Metadata
+
+```{r}
+# Read in array metadata
+array_metadata <- read.metharray.sheet(paste0(data_dir, "/E181906_SarahRice_GSA_290323/"), pattern="E181906_SRice_GSA_SampleSheet_290323")
+extra_metadata <- read.table(paste0(data_dir,"/E181906_SarahRice_GSA_290323/E181906_SarahRice_GSA_290323_SamplesTable.txt"), sep="\t", header=TRUE)
+
+# Merge data together (removing NA columns)
+array_metadata$Sample_ID <- as.character(array_metadata$Sample_ID)
+extra_metadata$Sample.ID <- as.character(extra_metadata$Sample.ID)
+metadata <- merge(array_metadata[,unique(sapply(array_metadata, function(col) !is.na(col)))], extra_metadata, by.x="Sample_ID", by.y="Sample.ID")
+
+# Read in sample metadata
+sample_metadata <- readxl::read_xlsx(paste0(data_dir,"/sample_metadata.xlsx"))
+metadata <- merge(sample_metadata, metadata, by.x="embryo_id", by.y="Sample_ID")
+
+# Get sample sheet format to read in idats
+sample_sheet <- metadata[,c("embryo_id","plate_well","SentrixBarcode_A","SentrixPosition_A","Gender")]
+colnames(sample_sheet)[1] <- c("Sample_ID")
+sample_sheet$Sample_ID <- as.character(sample_sheet$Sample_ID)
+
+# Sort batches
+metadata["Batch"] <- as.character(metadata$SentrixBarcode_A)
+
+```
+
+### Add BMI groups
+
+```{r}
+
+metadata["BMI_GROUP"] <- "Underweight"
+metadata[metadata$mat_bmi >= 18.5 & metadata$mat_bmi < 24.9,]["BMI_GROUP"] <- "Normal"
+metadata[metadata$mat_bmi >= 25 & metadata$mat_bmi < 29.9,]["BMI_GROUP"] <- "Overweight"
+metadata[metadata$mat_bmi >= 30 & metadata$mat_bmi < 34.9,]["BMI_GROUP"] <- "Obese"
+metadata[metadata$mat_bmi >= 35,]["BMI_GROUP"] <- "Extremely Obese"
+
+```
+
+### Get covariates for data
+
+```{r}
+
+# Get metadata to save
+tosave_meta <- metadata[,c("embryo_id","embryo_id","sex","BMI_GROUP")]
+colnames(tosave_meta)[1:2] <- c("FID","IID")
+
+# Sort out sex
+tosave_meta$sex <- ifelse(tosave_meta$sex == "male", "1", "2")
+
+# Save
+write.table(tosave_meta, paste0(data_dir,"sample_metadata.for_plink.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+```
+
+### Define colour palettes
+
+```{r}
+
+# Categorial
+sex_pal <- c("green", "mediumpurple")
+well_pal <- brewer.pal(length(unique(metadata$ARRAY_ROW)),"Dark2")
+batch_pal <- brewer.pal(length(unique(metadata$Batch)),"Set1"); names(batch_pal) <- unique(metadata$Batch)
+
+# Define BMI group colours
+bmi_cols <- npreg::number2color(c(1,2,3,4,5), c("yellow","darkred"), equidistant = FALSE, xmin=1, xmax=5)
+names(bmi_cols) <- c("Underweight","Normal","Overweight","Obese","Extremely Obese")
+
+# Continuous
+weeks.col_ramp <- colour_ramp(c("white","darkgreen"), na.color="grey", alpha=TRUE)
+mat_age.col_ramp <- colour_ramp(c("white","blue"), na.color="grey", alpha=TRUE)
+bmi.col_ramp <- colour_ramp(c("white","darkorange"), na.color="grey", alpha=TRUE)
+
+```
+
+### Read in PLINK output
+
+```{r}
+
+# Read in files
+plink_data.df <- ReadPLINKtoDF(paste0(plink_dir,"/all_individuals.merged.q_filt"))
+
+# Sort chromosomes
+plink_data.df$chr <- gsub("chr","",plink_data.df$chr)
+
+# Add Chr/position id marker
+plink_data.df["CHRPOSID"] <- paste(plink_data.df$chr, plink_data.df$pos, plink_data.df$ref, plink_data.df$alt, sep=":")
+
+# Save
+saveRDS(plink_data.df,file=paste0(imp_dir,"/all_individuals.merged.q_filt.df.RDS"))
+
+```
+
+### Read in Imputed
+
+```{r}
+
+imp_filename <- paste0(imp_dir,"/imputed.hrc.read_into_R.rds")
+
+# If edited file with RSIDs doesn't exist, general
+regenerateFile <- TRUE
+if (!file.exists(imp_filename) | regenerateFile) {
+
+  # Read in files
+  print("## Reading in data and formatting for R......")
+  imput_data.df <- ReadPLINKtoDF(paste0(imp_dir,"/imputed.hrc.plink.q_filt", sep=""))
+  
+  # Add Chr/position id marker
+  imput_data.df["CHRPOSID"] <- imput_data.df$marker
+  
+  # Fix sample names
+  colnames(imput_data.df) <- gsub("_[0-9]*_Cart","",colnames(imput_data.df))
+  
+  # Save
+  print("## Saving......")
+  saveRDS(imput_data.df, imp_filename)
+
+# Else file is present
+} else {
+  
+  # Read in
+  print("## Reading in pre-saved data......")
+  imput_data.df <- readRDS(imp_filename)
+
+}
+
+```
+
+### Retain only autosomes
+
+```{r}
+
+# Drop non-autosomes
+plink_data.df <- plink_data.df[which(plink_data.df$chr %in% as.character(1:22)),]
+imput_data.df <- imput_data.df[which(imput_data.df$chr %in% as.character(1:22)),]
+
+# Check chromosomes - should be 22!
+length(unique(plink_data.df$chr)); sort(as.numeric(unique(plink_data.df$chr)))
+length(unique(imput_data.df$chr)); sort(as.numeric(unique(imput_data.df$chr)))
+dim(plink_data.df)
+dim(imput_data.df)
+
+```
+
+### Plot PCAs
+
+#### Imputed
+
+The command line scripts to process the 1000genomes data and merge in the imputated data are run prior to this R code.
+
+```{r}
+
+OneKGPCA <- read.table("1000Genomes/qcdir/imputed.hrc.plink.q_filt..eigenvec")
+OneKGPCA.eigenval <- read.table("1000Genomes/qcdir/imputed.hrc.plink.q_filt..eigenval")
+
+OneKGPCA.eigenval$V1 <- OneKGPCA.eigenval$V1 / sum(OneKGPCA.eigenval$V1) * 100
+OneKGPCA.eigenval <- data.frame(PC=paste0("PC",1:nrow(OneKGPCA.eigenval)), variance.percent=OneKGPCA.eigenval$V1)
+
+
+#read in the popultion codes
+#from https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/phase3/20130725.phase3.cg_sra.index
+
+samplePop <- read.table("20130606_g1k_3202_samples_ped_population.txt",header=TRUE)
+
+colnames(OneKGPCA)[3:ncol(OneKGPCA)] <- paste0("PC", 1:(ncol(OneKGPCA)-2))
+OneKGPCA <- merge(samplePop, OneKGPCA, by.x="SampleID", by.y="V2",all.y=TRUE)
+
+OneKGPCA[ is.na(OneKGPCA$Superpopulation),"Superpopulation"] <- "CurrentStudy"
+OneKGPCA[ OneKGPCA$V1==0,"V1"] <- ""
+
+#save the eur sample ids for later maf calculations
+eur <- samplePop[ samplePop$Superpopulation == "EUR",2]
+eur <- data.frame(0,eur)
+
+write.table(eur, file="mqtl/coloc/european1000genomessamples.txt", sep=" ", quote=FALSE, row.names=FALSE,col.names = FALSE)
+
+
+
+#The first four pcs seem to correspond to the superpopulations
+#Similar to the GTex study - 10.1126/science.aaz1776
+pc12.plt <- Plot2DPCA(meta=OneKGPCA, var=OneKGPCA.eigenval, pcs = c(1,2), label_id="V1", color_by="Superpopulation")
+pc13.plt <- Plot2DPCA(meta=OneKGPCA, var=OneKGPCA.eigenval, pcs = c(1,3), label_id="V1", color_by="Superpopulation")
+pc14.plt <- Plot2DPCA(meta=OneKGPCA, var=OneKGPCA.eigenval, pcs = c(1,4), label_id="V1", color_by="Superpopulation")
+pc15.plt <- Plot2DPCA(meta=OneKGPCA, var=OneKGPCA.eigenval, pcs = c(1,5), label_id="V1", color_by="Superpopulation")
+
+# Save
+ggsave(paste0(pca_dir, "AncestryPCA.png"), pc12.plt + cowplot::theme_cowplot(), units="px", width=4000, height=4000)
+
+
+varplot <- ggplot(OneKGPCA.eigenval, aes(x=reorder(PC, `variance.percent`, decreasing=TRUE), y=`variance.percent`)) + 
+  geom_bar(stat="identity", fill="lightblue", color="white") +
+  geom_hline(yintercept=0, linetype="dashed", color="darkgrey") +
+  xlab("PC") + ylab("Variance Explained") +
+  theme_bw()
+
+ggsave(paste0(pca_dir, "AncestryScreePlot.png"), varplot, units="px", width=4000, height=4000)
+
+```
+
+#### Save
+
+```{r}
+# Save metadata with PCA to use as covariates
+write.table(OneKGPCA, paste0(res_dir,"/genotyping_pca_metadata.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+```
+
+## sessionInfo
+```{r}
+writeLines(capture.output(sessionInfo()), paste0(log_dir,"genotyping_sessionInfo.txt"))
+```
+

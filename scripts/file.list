@@ -1,0 +1,3 @@
+../results/imputation/imputed/*chr*.vcf.bcf
+../results/imputation/imputed/*chr*.vcf.gz.bcf
+../results/imputation/imputed/*chr*.vcf.bcf

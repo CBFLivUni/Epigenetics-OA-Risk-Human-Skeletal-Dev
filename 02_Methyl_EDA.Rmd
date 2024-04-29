@@ -1,0 +1,451 @@
+---
+title: "Methylation - EDA"
+format: html
+---
+
+### Libraries
+
+```{r}
+
+# Plotting and graphics
+library(ggplot2)
+library(RColorBrewer)
+library(scales)
+library(colorspace)
+
+# Data QC 
+library(wateRmelon)
+library(DNAmArray)
+library(minfi)
+library(sva)
+library(maxprobes)
+
+# Annotation
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+# Programming, parsing and data wrangling
+library(mgsub)
+library(GenomicFeatures)
+#library(doSNOW) # parallel processes on Windows
+library(foreach)
+library(RcppEigen) # For faster lm 
+
+# Statistics and analyses
+library(limma)
+library(factoextra)
+library(sva)
+library(pvca)
+library(dmrff)
+library(DMRcate)
+
+# Gene ontology
+library(clusterProfiler)
+#library(methylGSA)
+
+```
+
+### Parameters
+
+```{r}
+#set the treat log2 treshold
+trt_log2fc_thr <- 0.1
+
+```
+
+### Directories
+
+```{r}
+
+# Defined main dir
+scripts_dir <- getwd()
+main_dir <- "methylation/"
+data_dir <- "rawdata/"
+res_dir <- "results/"
+pca_dir <- "pca/"
+dmr_dir <- "dmr/"
+de_dir <- "differential_methylation/"
+util_dir <- "utilities/"
+
+```
+
+## Read in the pre-processed data
+
+```{r}
+preProccessedData <- readRDS(paste0(data_dir,"preproccessed_methyl.RDS"))
+qnt.mSetSqFlt <- preProccessedData$qnt.mSetSqFlt
+fun.mSetSqFlt <- preProccessedData$fun.mSetSqFlt
+metadata <- preProccessedData$metadata
+annotdata <- preProccessedData$annotdata
+```
+
+### Define colour palettes
+
+```{r}
+
+# Categorial
+sex_pal <- c("green", "mediumpurple")
+array_pal <- hue_pal()(length(unique(metadata$Array)))
+well_pal <- brewer.pal(length(unique(metadata$ARRAY_ROW)),"Dark2")
+batch_pal <- brewer.pal(length(unique(metadata$Batch)),"Set1"); names(batch_pal) <- unique(metadata$Batch) 
+
+# Define BMI group colours
+bmi_cols <- npreg::number2color(c(1,2,3,4,5), c("yellow","darkred"), equidistant = FALSE, xmin=1, xmax=5)
+names(bmi_cols) <- c("Underweight","Normal","Overweight","Obese","Extremely Obese")
+
+# Continuous
+weeks.col_ramp <- colour_ramp(c("white","darkgreen"), na.color="grey", alpha=TRUE)
+mat_age.col_ramp <- colour_ramp(c("white","blue"), na.color="grey", alpha=TRUE)
+bmi.col_ramp <- colour_ramp(c("white","darkorange"), na.color="grey", alpha=TRUE)
+
+```
+
+#### Scale data
+
+```{r}
+
+# Scale data
+metadata["Z_STAGE_WEEKS"] <- scale(metadata$stage_weeks, scale=TRUE, center=TRUE)
+metadata["Z_MAT_BMI"] <- scale(metadata$mat_bmi, scale=TRUE, center=TRUE)
+metadata["Z_MAT_AGE"] <- scale(metadata$mat_age, scale=TRUE, center=TRUE)
+
+```
+
+#### Get ordered M-values
+
+```{r}
+
+# Get M-normalised matrix
+## Quantile
+qnt.m_mat <- minfi::getM(qnt.mSetSqFlt)
+qnt.m_mat <- as.matrix(na.omit(qnt.m_mat))
+qnt.m_mat <- qnt.m_mat[order(rowVars(qnt.m_mat), decreasing=TRUE),]
+
+## Functional
+fun.m_mat <- minfi::getM(fun.mSetSqFlt)
+fun.m_mat <- as.matrix(na.omit(fun.m_mat))
+fun.m_mat <- fun.m_mat[order(rowVars(fun.m_mat), decreasing=TRUE),]
+
+```
+
+#### SVA
+
+No surrogate variables after taking into account known batch. Currently errors with `Error in solve.default(t(mod0) %*% mod0) : 'a' is 0-diml`.
+
+# Define matrices
+
+modBatch \<- model.matrix(\~ 0 + sex + Batch + Z_STAGE_WEEKS + Z_MAT_BMI + Z_MAT_AGE, data=metadata) modRow \<- model.matrix(\~ 0 + sex + ARRAY_ROW + Z_STAGE_WEEKS + Z_MAT_BMI + Z_MAT_AGE, data=metadata) mod0 \<- model.matrix(\~ 0, data=metadata)
+
+# Run SV analysis
+
+nSVBatch \<- num.sv(qnt.m_mat\[,rownames(modBatch)\], modBatch, method="leek"); nSVBatch nSVRow \<- num.sv(qnt.m_mat\[,rownames(modRow)\], modRow, method="leek"); nSVRow
+
+# Get results
+
+svObjBatch \<- sva(qnt.m_mat, modBatch, mod0, n.sv=nSVBatch); svObjBatch svObjRow \<- sva(qnt.m_mat, modRow, mod0, n.sv=nSVRow); svObjRow
+
+#### Combat
+
+This checks how equivalent array row and sentrix id (batch) are and which is best to adjust for.
+
+Have to drop sex due to confounding. But shouldn't have a huge impact really.
+
+```{r}
+
+# Define combat matrix
+modCombat <- model.matrix(~ 0 + Z_STAGE_WEEKS + Z_MAT_BMI + Z_MAT_AGE, data=metadata)
+
+# Adjust
+metadata$Sample_Name <- as.character(metadata$Sample_Name)
+combatBatchAdj <- ComBat(dat=qnt.m_mat[,metadata$Sample_Name], batch=metadata$Batch, mod=modCombat[rownames(metadata),], par.prior=TRUE, prior.plots=TRUE)
+combatRowAdj <- ComBat(dat=qnt.m_mat[,metadata$Sample_Name], batch=metadata$ARRAY_ROW, mod=modCombat[rownames(metadata),], par.prior=TRUE, prior.plots=TRUE)
+
+```
+
+#### Manual PCA
+
+```{r}
+
+source(paste0(util_dir,"R/pca_utility_functions.R"))
+
+prop_probes.by_var <- 0.95
+
+# Run PCA
+qnt.pca_res <- prcomp(t(qnt.m_mat[1:(nrow(qnt.m_mat)*prop_probes.by_var),]), center=TRUE, scale=TRUE)
+fun.pca_res <- prcomp(t(fun.m_mat[1:(nrow(fun.m_mat)*prop_probes.by_var),]), center=TRUE, scale=TRUE)
+bat.pca_res <- prcomp(t(combatBatchAdj[1:(nrow(combatBatchAdj)*prop_probes.by_var),]), center=TRUE, scale=TRUE)
+row.pca_res <- prcomp(t(combatRowAdj[1:(nrow(combatRowAdj)*prop_probes.by_var),]), center=TRUE, scale=TRUE)
+
+# Merge with metadata
+metadata$BMI_GROUP <- factor(metadata$BMI_GROUP, levels=c("Underweight","Normal","Overweight","Obese","Extremely Obese"))
+qnt.pca_metadata <- merge(metadata[,!grepl("^PC",colnames(metadata))], qnt.pca_res$x, by.x="Sample_Name", by.y="row.names")
+fun.pca_metadata <- merge(metadata[,!grepl("^PC",colnames(metadata))], fun.pca_res$x, by.x="Sample_Name", by.y="row.names")
+bat.pca_metadata <- merge(metadata[,!grepl("^PC",colnames(metadata))], bat.pca_res$x, by.x="Sample_Name", by.y="row.names")
+row.pca_metadata <- merge(metadata[,!grepl("^PC",colnames(metadata))], row.pca_res$x, by.x="Sample_Name", by.y="row.names")
+
+```
+
+#### Plot Quantile PCA
+
+```{r}
+
+# Reorder sex match
+qnt.pca_metadata$SEX_MATCH <- factor(qnt.pca_metadata$SEX_MATCH, levels=c("DIFFERENT","SAME"))
+
+# Loop over consecutive PCs
+for (pc in list(c(1,2), c(2,3), c(3,4), c(4,5))) {
+
+  # Generate plots
+  sex_plt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="sex", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=c("green","mediumpurple"))
+  row_plt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="ARRAY_ROW", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=well_pal)
+  bmig_plt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="BMI_GROUP", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=bmi_cols)
+  batch_plt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="Batch", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=batch_pal)
+  age_plt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="mat_age", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkblue", low="white")
+  weeks_plt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="stage_weeks", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkgreen", low="white")
+  tri_plt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="TRIMESTER", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=c("#FEE391", "#EC7014", "#662506"))
+  bmi_plt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="mat_bmi", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkorange", low="white")
+  
+  # Save
+  dir.create(paste0(pca_dir, "unadjusted/"), recursive=TRUE)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.qnt_norm.pc",paste(pc, collapse=""),".colby_sex.propprobes",prop_probes.by_var,".png"), sex_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.qnt_norm.pc",paste(pc, collapse=""),".colby_arrayrow.propprobes",prop_probes.by_var,".png"), row_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.qnt_norm.pc",paste(pc, collapse=""),".colby_bmigroup.propprobes",prop_probes.by_var,".png"), bmig_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.qnt_norm.pc",paste(pc, collapse=""),".colby_batch.propprobes",prop_probes.by_var,".png"), batch_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.qnt_norm.pc",paste(pc, collapse=""),".colby_maternalage.propprobes",prop_probes.by_var,".png"), age_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.qnt_norm.pc",paste(pc, collapse=""),".colby_stageweeks.propprobes",prop_probes.by_var,".png"), weeks_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.qnt_norm.pc",paste(pc, collapse=""),".colby_trimester.propprobes",prop_probes.by_var,".png"), tri_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.qnt_norm.pc",paste(pc, collapse=""),".colby_bmi.propprobes",prop_probes.by_var,".png"), bmi_plt, units="px", width=3000, height=3000)
+  
+}
+
+
+```
+
+#### Plotting of batch effect (sentrix ID) in the four PCA plots
+
+```{r}
+
+#loop through the PC combinations
+pcs <- list(c(1,2), c(2,3), c(3,4), c(4,5))
+plots <- lapply(pcs,function(pc) Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="Batch", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=batch_pal) +  cowplot::theme_cowplot(font_size = 18))
+
+#make one plot
+batchPlot <- plot_grid(plotlist = plots,labels=LETTERS[1:4])
+
+#save the combined plot
+ggsave(paste0(pca_dir, "unadjusted/batchEffectPCA.png"), batchPlot, units="in", width=12, height=7,bg = "white")
+
+```
+
+
+
+
+#### Plot Combat Sentrix ID-adjusted
+
+```{r}
+
+# Reorder sex match
+bat.pca_metadata$SEX_MATCH <- factor(bat.pca_metadata$SEX_MATCH, levels=c("DIFFERENT","SAME"))
+
+# Loop over consecutive PCs
+for (pc in list(c(1,2), c(2,3), c(3,4), c(4,5))) {
+
+  # Generate plots
+  sex_plt <- Plot2DPCA(meta=bat.pca_metadata, var=get_eigenvalue(bat.pca_res), color_by="sex", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=c("green","mediumpurple"))
+  row_plt <- Plot2DPCA(meta=bat.pca_metadata, var=get_eigenvalue(bat.pca_res), color_by="ARRAY_ROW", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=well_pal)
+  bmig_plt <- Plot2DPCA(meta=bat.pca_metadata, var=get_eigenvalue(bat.pca_res), color_by="BMI_GROUP", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=bmi_cols)
+  batch_plt <- Plot2DPCA(meta=bat.pca_metadata, var=get_eigenvalue(bat.pca_res), color_by="Batch", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=batch_pal)
+  age_plt <- Plot2DPCA(meta=bat.pca_metadata, var=get_eigenvalue(bat.pca_res), color_by="mat_age", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkblue", low="white")
+  weeks_plt <- Plot2DPCA(meta=bat.pca_metadata, var=get_eigenvalue(bat.pca_res), color_by="stage_weeks", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkgreen", low="white")
+  tri_plt <- Plot2DPCA(meta=bat.pca_metadata, var=get_eigenvalue(bat.pca_res), color_by="TRIMESTER", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=c("#FEE391", "#EC7014", "#662506"))
+  bmi_plt <- Plot2DPCA(meta=bat.pca_metadata, var=get_eigenvalue(bat.pca_res), color_by="mat_bmi", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkorange", low="white")
+  
+  # Save
+  dir.create(paste0(pca_dir, "comBat_sentrixID/"), recursive=TRUE)
+  ggsave(paste0(pca_dir, "comBat_sentrixID/pca_biplot.qnt_norm.combatBatchAdj.pc",paste(pc, collapse=""),".colby_sex.propprobes",prop_probes.by_var,".png"), sex_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "comBat_sentrixID/pca_biplot.qnt_norm.combatBatchAdj.pc",paste(pc, collapse=""),".colby_arrayrow.propprobes",prop_probes.by_var,".png"), row_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "comBat_sentrixID/pca_biplot.qnt_norm.combatBatchAdj.pc",paste(pc, collapse=""),".colby_bmigroup.propprobes",prop_probes.by_var,".png"), bmig_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "comBat_sentrixID/pca_biplot.qnt_norm.combatBatchAdj.pc",paste(pc, collapse=""),".colby_batch.propprobes",prop_probes.by_var,".png"), batch_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "comBat_sentrixID/pca_biplot.qnt_norm.combatBatchAdj.pc",paste(pc, collapse=""),".colby_maternalage.propprobes",prop_probes.by_var,".png"), age_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "comBat_sentrixID/pca_biplot.qnt_norm.combatBatchAdj.pc",paste(pc, collapse=""),".colby_stageweeks.propprobes",prop_probes.by_var,".png"), weeks_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "comBat_sentrixID/pca_biplot.qnt_norm.combatBatchAdj.pc",paste(pc, collapse=""),".colby_trimester.propprobes",prop_probes.by_var,".png"), tri_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "comBat_sentrixID/pca_biplot.qnt_norm.combatBatchAdj.pc",paste(pc, collapse=""),".colby_bmi.propprobes",prop_probes.by_var,".png"), bmi_plt, units="px", width=3000, height=3000)
+  
+}
+
+```
+
+#### Plot Combat Sentrix Position-adjusted
+
+```{r}
+
+# Reorder sex match
+row.pca_metadata$SEX_MATCH <- factor(row.pca_metadata$SEX_MATCH, levels=c("DIFFERENT","SAME"))
+
+# Loop over consecutive PCs
+for (pc in list(c(1,2), c(2,3), c(3,4), c(4,5))) {
+
+  # Generate plots
+  sex_plt <- Plot2DPCA(meta=row.pca_metadata, var=get_eigenvalue(row.pca_res), color_by="sex", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=c("green","mediumpurple"))
+  row_plt <- Plot2DPCA(meta=row.pca_metadata, var=get_eigenvalue(row.pca_res), color_by="ARRAY_ROW", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=well_pal)
+  bmig_plt <- Plot2DPCA(meta=row.pca_metadata, var=get_eigenvalue(row.pca_res), color_by="BMI_GROUP", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=bmi_cols)
+  batch_plt <- Plot2DPCA(meta=row.pca_metadata, var=get_eigenvalue(row.pca_res), color_by="Batch", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=batch_pal)
+  age_plt <- Plot2DPCA(meta=row.pca_metadata, var=get_eigenvalue(row.pca_res), color_by="mat_age", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkblue", low="white")
+  weeks_plt <- Plot2DPCA(meta=row.pca_metadata, var=get_eigenvalue(row.pca_res), color_by="stage_weeks", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkgreen", low="white")
+  tri_plt <- Plot2DPCA(meta=row.pca_metadata, var=get_eigenvalue(row.pca_res), color_by="TRIMESTER", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=c("#FEE391", "#EC7014", "#662506"))
+  bmi_plt <- Plot2DPCA(meta=row.pca_metadata, var=get_eigenvalue(row.pca_res), color_by="mat_bmi", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkorange", low="white")
+  
+  # Save
+  dir.create(paste0(pca_dir, "comBat_sentrixPosition/"), recursive=TRUE)
+  ggsave(paste0(pca_dir, "comBat_sentrixPosition/pca_biplot.qnt_norm.combatRowAdj.pc",paste(pc, collapse=""),".colby_sex.propprobes",prop_probes.by_var,".png"), sex_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "comBat_sentrixPosition/pca_biplot.qnt_norm.combatRowAdj.pc",paste(pc, collapse=""),".colby_arrayrow.propprobes",prop_probes.by_var,".png"), row_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "comBat_sentrixPosition/pca_biplot.qnt_norm.combatRowAdj.pc",paste(pc, collapse=""),".colby_bmigroup.propprobes",prop_probes.by_var,".png"), bmig_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "comBat_sentrixPosition/pca_biplot.qnt_norm.combatRowAdj.pc",paste(pc, collapse=""),".colby_batch.propprobes",prop_probes.by_var,".png"), batch_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "comBat_sentrixPosition/pca_biplot.qnt_norm.combatRowAdj.pc",paste(pc, collapse=""),".colby_maternalage.propprobes",prop_probes.by_var,".png"), age_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "comBat_sentrixPosition/pca_biplot.qnt_norm.combatRowAdj.pc",paste(pc, collapse=""),".colby_stageweeks.propprobes",prop_probes.by_var,".png"), weeks_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "comBat_sentrixPosition/pca_biplot.qnt_norm.combatRowAdj.pc",paste(pc, collapse=""),".colby_trimester.propprobes",prop_probes.by_var,".png"), tri_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "comBat_sentrixPosition/pca_biplot.qnt_norm.combatRowAdj.pc",paste(pc, collapse=""),".colby_bmi.propprobes",prop_probes.by_var,".png"), bmi_plt, units="px", width=3000, height=3000)
+  
+}
+
+```
+
+#### Save matrix and metadata with PCA
+
+```{r}
+
+# Save methylation matrix
+write.table(minfi::getM(qnt.mSetSqFlt), paste0(res_dir,"methylation_matrix.mvals.tsv"), sep="\t", quote=FALSE, row.names=TRUE, col.names=NA)
+write.table(minfi::getBeta(qnt.mSetSqFlt), paste0(res_dir,"methylation_matrix.betavals.tsv"), sep="\t", quote=FALSE, row.names=TRUE, col.names=NA)
+
+# Save metadata with PCA
+write.table(qnt.pca_metadata, paste0(res_dir,"methylation_sample_metadata.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+# Save annotation data
+write.table(as.data.frame(annotdata)[,1:24], paste0(res_dir,"methylation_probe_data.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+# as.data.frame(annotdata)[339601:339610,1:24]
+# as.data.frame(annotdata)[339603,1:24]
+
+```
+
+#### PVCA
+
+```{r}
+
+ProcessPVCA <- function(res, method_key, source_toggle=TRUE) {
+  
+  # Get as df
+  df <- data.frame(as.data.frame(res$label), t(as.data.frame(res$dat)), Method=method_key)
+  colnames(df) <- c("Effect", "Variance", "Method")
+  
+  # Return
+  return(df)
+}
+
+# Set threshold for variance explained to consider
+varexpl_thr <- 0.75
+
+# Expressionset data
+ordered_m <- minfi::getM(qnt.mSetSqFlt)[order(rowVars(minfi::getM(qnt.mSetSqFlt)), decreasing=TRUE),]
+expr_raw <- ExpressionSet(assayData = ordered_m[1:floor(nrow(ordered_m)*0.1),rownames(metadata)], 
+                          phenoData = new("AnnotatedDataFrame", data = metadata[,c("Batch","mat_bmi","mat_age","sex","stage_weeks")]))
+# expr_sva <- ExpressionSet(assayData = ordered_m[1:floor(nrow(ordered_m)*0.05),rownames(metadata)], 
+#                          phenoData = new("AnnotatedDataFrame", data = metadata[,c("Batch","mat_bmi","mat_age","sex","stage_weeks","SV1","SV2")]))
+
+# Run PVCA
+pvca_raw <- pvcaBatchAssess(abatch = expr_raw, batch.factors = c("Batch","sex","mat_bmi","mat_age","stage_weeks"), threshold = varexpl_thr)
+# pvca_sva <- pvcaBatchAssess(abatch = expr_sva, batch.factors = c("Batch","sex","stage_weeks","SV1","SV2"), threshold = varexpl_thr)
+
+# Process PVCA results
+pvca_raw.df <- ProcessPVCA(pvca_raw, method_key="Un-adjusted")
+# pvca_sva.df <- ProcessPVCA(pvca_sva, method_key="SVA")
+
+# Plot
+raw_plt <- ggplot(pvca_raw.df, aes(x=Effect, y=Variance)) + 
+  geom_bar(stat="identity", position="dodge", fill=lighten("darkblue", 0.5)) + 
+  xlab("") + ylab("Variance") + ylim(0,0.6) +
+  theme_bw(base_size=16) + theme(legend.position = "top",
+                                 axis.text.x = element_text(size=10, angle=90, hjust=1, vjust=0.5))
+# sva_plt <- ggplot(pvca_sva.df, aes(x=gsub("Z_","",Effect), y=Variance)) + 
+#   geom_bar(stat="identity", position="dodge", fill=lighten("darkblue", 0.5)) + 
+#   facet_grid(cols=vars(Type, Int_Type), space="free_x", scale="free_x") +
+#   xlab("") + ylab("Variance") + ylim(0,0.6) +
+#   theme_bw() + theme(axis.text.x=element_blank(), legend.position = "top")
+
+# Save
+ggsave(paste0(pca_dir, "pvca_plot.png"), raw_plt, units="px", width=3000, height=1500)
+
+```
+
+### Region of interest
+
+This attempts to see if the correlation between the CpGs at this loci is greater than the background.
+
+chr6:44,387,541 - 45,768,569
+
+```{r}
+
+# Get probe within region
+chr_annotdata <- annotdata[annotdata$chr == "chr6",]
+sub_annotdata <- data.frame(chr_annotdata[chr_annotdata$pos > 44387541 & chr_annotdata$pos < 45768569,])
+
+# Subset matrix
+sub_m <- minfi::getBeta(qnt.mSetSqFlt)[which(rownames(minfi::getBeta(qnt.mSetSqFlt)) %in% rownames(sub_annotdata)),]
+
+# Get mean per covariate
+for (group in unique(metadata$BMI_GROUP)) {
+  
+  # Get group
+  print(group)
+  sub_annotdata <- sub_annotdata[rownames(sub_m),]
+  sub_annotdata[[group]] <- unlist(rowMeans(sub_m[,as.character(metadata[metadata$BMI_GROUP == group,]$Sample_Name)]))
+
+}
+
+# Melt
+sub_annotdata["Probe"] <- rownames(sub_annotdata)
+tall.annotdata <- melt(sub_annotdata[,c("pos","chr","Relation_to_Island","Name",as.character(unique(metadata$BMI_GROUP)))], id.vars=c("pos","chr","Relation_to_Island","Name"))
+
+# Plot
+ggplot(sub_annotdata, aes(x=pos, y=rowMeans(sub_m)[rownames(sub_annotdata)], group=chr)) + 
+  geom_point() + 
+  # geom_hline(yintercept=background_mean.beta, linetype="dashed", color="blue") +
+  geom_hline(yintercept=0, linetype="dashed") +
+  xlab("Nucleotide position") + ylab("Mean % Methylated (Beta value)") +
+  theme_bw() + theme(legend.position="top")
+plt <- ggplot(tall.annotdata, aes(x=pos, y=value, fill=variable)) +
+  geom_point(shape=21) + 
+  scale_fill_manual(values=bmi_cols) +
+  facet_grid(rows=vars(variable)) +
+  # geom_hline(yintercept=background_mean.beta, linetype="dashed", color="blue") +
+  geom_hline(yintercept=0, linetype="dashed", color="darkgrey") +
+  xlab("Nucleotide position") + ylab("Mean % Methylated (Beta value)") +
+  theme_bw() + theme(legend.position="top")
+
+# Save
+ggsave(paste0(res_dir, "meanbeta_by_nt.splitbybmigroup.png"), plt, units="px", width=4000, height=2500)
+
+```
+
+### Wilcox tests
+
+```{r}
+
+for (bmi1 in unique(metadata$BMI_GROUP)) {
+  
+  for (bmi2 in unique(metadata$BMI_GROUP)) {
+   
+    if (bmi1 != bmi2) {
+      
+      wcx <- wilcox.test(tall.annotdata[tall.annotdata$variable == bmi1 & tall.annotdata$pos > 44800000 & tall.annotdata$pos < 45300000,]$value,
+                         tall.annotdata[tall.annotdata$variable == bmi1 & tall.annotdata$pos > 44800000 & tall.annotdata$pos < 45300000,]$value)
+      print(paste0(bmi1," vs ", bmi2, " p = ",wcx$p.value))
+      
+    } 
+    
+  }
+  
+}
+
+```

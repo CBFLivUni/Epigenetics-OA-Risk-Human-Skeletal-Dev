@@ -1,0 +1,662 @@
+---
+title: "matrixQTL analysis"
+output: html_notebook
+---
+
+## Code
+
+### Libaries
+```{r}
+library(ggplot2)
+library(MatrixEQTL)
+library(httr)
+library(EnsDb.Hsapiens.v75)
+library(annotatr)
+library(stringr)
+library(dplyr)
+library(SNPlocs.Hsapiens.dbSNP155.GRCh37)
+library(forcats)
+library(testthat)
+
+set.seed(42)
+
+source("utilities/R/genotyping.R")
+```
+
+
+### Directories
+
+```{r}
+
+
+# Defined main dir
+scripts_dir <- getwd()
+main_dir <- scripts_dir
+data_dir <-"rawdata/"
+qced_dir <- "qced_data/"
+res_dir <- "results/"
+plink_dir <-  "qced_data/merged/"
+mqtl_dir <- "mqtl/"
+imp_dir <- "results/imputation/plink/"
+log_dir <-"logs/"
+
+```
+
+## load data
+
+```{r}
+mQTL_preData <- readRDS(paste0(data_dir,"matrixQTL_prep.RDS"))
+imp.meth_annot.df <- mQTL_preData$imp.meth_annot.df
+
+
+```
+
+
+
+
+#### Set parameters
+
+Most code adapted from: http://www.bios.unc.edu/research/genomic_software/Matrix_eQTL/R.html#cis
+
+```{r}
+
+# Linear model to use, modelANOVA, modelLINEAR, or modelLINEAR_CROSS
+useModel = modelLINEAR; # modelANOVA, modelLINEAR, or modelLINEAR_CROSS
+
+# Genotype file name
+all.SNP_file_name = paste(mqtl_dir, "snp_matrix.for_mqtl.all.tsv", sep="");
+
+coloc.SNP_file_name = paste(mqtl_dir, "snp_matrix.for_mqtl.coloc.tsv", sep="");
+
+# Gene expression file name
+all.expression_file_name = paste(mqtl_dir, "methylation_matrix.for_mqtl.imputed.tsv", sep="");
+
+# Output file name
+output_file_name = tempfile();
+
+# Only associations significant at this level will be saved
+pvOutputThreshold = 5e-2;
+
+# Output file name for cis/trans
+output_file_name_cis = tempfile();
+
+# Error covariance matrix
+# Set to numeric() for identity.
+errorCovariance = numeric()
+# errorCovariance = read.table("Sample_Data/errorCovariance.txt");
+
+# Distance for local gene-SNP pairs
+cisDist = 500000
+
+
+#load the snp positions
+imp.snp_loc.df <- read.delim(paste0(mqtl_dir, "snp_location.for_mqtl.imputed.tsv"))
+
+#load the methyl positions
+imp.meth_loc.df <- read.delim(paste0(mqtl_dir, "methylation_location.for_mqtl.imputed.tsv"))
+
+```
+
+### Genomewide analysis
+```{r}
+
+## Load genotype data
+snps = SlicedData$new();
+snps$fileDelimiter = "\t";      # the TAB character
+snps$fileOmitCharacters = "NA"; # denote missing values;
+snps$fileSkipRows = 1;          # one row of column labels
+snps$fileSkipColumns = 1;       # one column of row labels
+snps$fileSliceSize = 2000;      # read file in slices of 2,000 rows
+
+## Load gene expression data
+gene = SlicedData$new();
+gene$fileDelimiter = "\t";      # the TAB character
+gene$fileOmitCharacters = "NA"; # denote missing values;
+gene$fileSkipRows = 1;          # one row of column labels
+gene$fileSkipColumns = 1;       # one column of row labels
+gene$fileSliceSize = 2000;      # read file in slices of 2,000 rows
+
+# Get as files
+gene$LoadFile(all.expression_file_name);
+snps$LoadFile(all.SNP_file_name);
+
+```
+
+```{r}
+
+# Run  MatrixEQTL cis only
+
+#Set pvOutputThreshold = 0 and pvOutputThreshold.cis > 0 to perform eQTL analysis for local gene-SNP pairs only. Local associations significant at pvOutputThreshold.cis level will be recorded in output_file_name.cis and in the returned object.
+
+#note we save the file to reduce the memory requirements
+run_mqtlAnalysis <- function(covariates,snps,genes,output_file_name,useModel,
+                             errorCovariance,output_file_name_cis,pvOutputThreshold,snppos,methpos,cisDist){
+
+  
+  numPC <- paste0("numPC",stringr::str_extract(covariates,"\\d+"))
+    
+    ## Load covariates
+  cvrt = SlicedData$new();
+  cvrt$fileDelimiter = "\t";      # the TAB character
+  cvrt$fileOmitCharacters = "NA"; # denote missing values;
+  cvrt$fileSkipRows = 1;          # one row of column labels
+  cvrt$fileSkipColumns = 1;       # one column of row labels
+  
+  # Get as files
+  cvrt$LoadFile(covariates);
+  
+  ## Outliers removed
+  all.dist.me <- Matrix_eQTL_main(snps = snps,
+                             gene = genes,
+                             cvrt = cvrt,
+                             pvOutputThreshold     = 0,
+                             useModel = useModel,
+                             errorCovariance = errorCovariance,
+                             verbose = FALSE,
+                             output_file_name.cis = paste0("mQTL_results_numPC",numPC,"_cis.txt"),
+                             pvOutputThreshold.cis = pvOutputThreshold,
+                             snpspos = snppos,
+                             genepos = methpos,
+                             cisDist = cisDist,
+                             pvalue.hist = "qqplot",
+                             min.pv.by.genesnp = FALSE,
+                             noFDRsaveMemory = TRUE)
+  
+  return(all.dist.me)
+
+}
+
+tunePCs <- FALSE
+
+if(tunePCs) {
+
+covariateFiles <- sprintf("%scovariates.for_mqtl_numPC%s.tsv",mqtl_dir,0:4)
+
+results <- lapply(covariateFiles,run_mqtlAnalysis,snps,gene,output_file_name,useModel,
+                             errorCovariance,output_file_name_cis,pvOutputThreshold,snppos=imp.snp_loc.df,methpos=imp.meth_loc.df,cisDist)
+
+}
+
+
+```
+
+Two PCs in the covariate matrix maximises the number of sig mQTLs
+```{r}
+
+    ## Load covariates
+  cvrt = SlicedData$new();
+  cvrt$fileDelimiter = "\t";      # the TAB character
+  cvrt$fileOmitCharacters = "NA"; # denote missing values;
+  cvrt$fileSkipRows = 1;          # one row of column labels
+  cvrt$fileSkipColumns = 1;       # one column of row labels
+  
+  # Get as files
+  cvrt$LoadFile("mqtl/covariates.for_mqtl_numPC2.tsv");
+  
+  ## Outliers removed
+  all.dist.me <- Matrix_eQTL_main(snps = snps,
+                             gene = gene,
+                             cvrt = cvrt,
+                             pvOutputThreshold     = 0,
+                             useModel = useModel,
+                             errorCovariance = errorCovariance,
+                             verbose = FALSE,
+                             output_file_name.cis = "mQTL_results_numPC2_ciswithFDR.txt",
+                             pvOutputThreshold.cis = pvOutputThreshold,
+                             snpspos = imp.snp_loc.df,
+                             genepos = imp.meth_loc.df,
+                             cisDist = cisDist,
+                             pvalue.hist = "qqplot",
+                             min.pv.by.genesnp = FALSE,
+                             noFDRsaveMemory = FALSE)
+
+```
+
+
+### coloc
+
+```{r}
+
+## Load genotype data
+snps = SlicedData$new();
+snps$fileDelimiter = "\t";      # the TAB character
+snps$fileOmitCharacters = "NA"; # denote missing values;
+snps$fileSkipRows = 1;          # one row of column labels
+snps$fileSkipColumns = 1;       # one column of row labels
+snps$fileSliceSize = 2000;      # read file in slices of 2,000 rows
+
+# Get as files
+snps$LoadFile(coloc.SNP_file_name);
+```
+
+```{r}
+
+# Run  MatrixEQTL cis only
+
+#Set pvOutputThreshold = 0 and pvOutputThreshold.cis > 0 to perform eQTL analysis for local gene-SNP pairs only. Local associations significant at pvOutputThreshold.cis level will be recorded in output_file_name.cis and in the returned object.
+
+
+## Outliers removed
+coloc.dist.me = Matrix_eQTL_main(snps = snps,
+                           gene = gene,
+                           cvrt = cvrt,
+                           pvOutputThreshold     = 0,
+                           useModel = useModel,
+                           errorCovariance = errorCovariance,
+                           verbose = FALSE,
+                           output_file_name.cis = "mQTL_results_numPC4_coloc.txt",
+                           pvOutputThreshold.cis = 1,
+                           snpspos = imp.snp_loc.df,
+                           genepos = imp.meth_loc.df,
+                           cisDist = cisDist,
+                           pvalue.hist = "qqplot",
+                           min.pv.by.genesnp = FALSE,
+                           noFDRsaveMemory = FALSE)
+```
+
+
+### Get significant
+
+```{r}
+
+all.dist.me$cis$eqtls$bonferroni <- pmin(1,all.dist.me$cis$eqtls$pvalue * all.dist.me$cis$ntests)
+sig.dist_cis.all.me <- all.dist.me$cis$eqtls[all.dist.me$cis$eqtls$FDR < 0.05,]
+
+#how many significant methylation sites?
+length(unique(sig.dist_cis.all.me$gene))
+
+```
+
+
+## Add rsids
+```{r}
+#get all the mqtl result datasets
+datasets <- list(sig.dist_cis.all.me=sig.dist_cis.all.me)
+
+#utility function to split chrpos into two seperate columns
+splitChrPos <- function(dataset){
+  
+  string <- strsplit(dataset$snps,split=":")
+
+  dataset$chr <- sapply(string,"[[",1)
+  dataset$pos <- sapply(string,"[[",2)
+  colnames(dataset)[1] <- "CHRPOSID"
+  return(dataset)
+
+}
+
+#get the rsids for each dataset
+datasets <- lapply(datasets,splitChrPos)
+allData <- bind_rows(datasets)
+allData <- unique(allData[,c("CHRPOSID","chr","pos")])
+snpRsIDs <- GetRsIDs(allData, dir2save2=".", fileprefix="snps",reGenerateFile = TRUE)
+
+
+#function to merge the snp poschrid codes with rsid - keeping all entries as some snps have no valid rsid
+mergeRsIDs <- function(dataset,snpDF){
+
+  dataset <- merge(dataset,snpDF[,c("SNP","CHRPOSID")],by="CHRPOSID",all.x=TRUE)
+  return(dataset)
+
+}
+
+datasets <- lapply(datasets,mergeRsIDs,snpRsIDs)
+
+```
+
+### make mqtl id
+```{r}
+addID <- function(dataset){
+  dataset[is.na(dataset$SNP),"SNP"] <-  dataset[is.na(dataset$SNP),"CHRPOSID"]
+  dataset$mqtl <- paste(dataset$SNP,dataset$gene,sep="_")
+  return(dataset)
+}
+
+datasets <- lapply(datasets,addID)
+
+
+```
+
+### Add annotations
+
+```{r}
+
+# Add CpG annotations
+## Non-imputed
+#function to return the nearest protein coding gene given coordinates
+getNearestProtein <- function(coords){
+  
+  #using hg19 based reference
+  ens <- genes(EnsDb.Hsapiens.v75)
+  
+  #keep protein coding genes only
+  ens <- ens[ens$gene_biotype=="protein_coding",]
+  
+  #convert the coordinates to a GRange - note the chr without "chr"
+  colnames(coords) <- c("chr","start","end")
+  coords$chr <- gsub("chr","",coords$chr)
+  
+  gr <- GRanges(coords)
+  
+  #get the nearest gene
+  nearest <- ens[nearest(gr,ens)]
+  
+  return(nearest$symbol)
+  
+}
+
+#function to return the type of genomic region given coordinates and an annotation gRanges
+getGenomicRegionType <- function(coords,annotations){
+  
+  #parse the coords 
+  colnames(coords) <- c("chr","start","end")
+  coords$combined <- do.call(paste0, data.frame(coords))
+  
+  #convert the coordinate df to a grange object
+  gr <- GRanges(coords)
+  
+  # Intersect the regions we read in with the annotations
+  dm_annotated = annotate_regions(
+    regions = gr,
+    annotations = annotations,
+    ignore.strand = TRUE,
+    quiet = FALSE)
+
+  #df to parse more easily
+  dm_annotated_df = data.frame(dm_annotated)
+  
+  #collapse the annotate types
+  dm_annotated_df <- dm_annotated_df %>% group_by(seqnames,start,end,combined) %>%
+    summarize(annot.type = paste(unique(annot.type), collapse = ","))
+  
+  #match up in the original order as dplyr summarise rearranges
+  dm_annotated_df <- dm_annotated_df[ match(coords$combined,dm_annotated_df$combined),]
+  dm_annotated_df$annot.type <- gsub("hg19_genes_","",dm_annotated_df$annot.type)
+  
+  return(dm_annotated_df$annot.type)
+  
+}
+
+```
+## Annotate the genome wide results
+
+```{r}
+#It is computationally demanding to precompute the snp-cpg pairwise distances genome wide so we just calculate on the fly for the sig mqtls
+
+#function to get the distances given vectors of cpgs, cnps, and the locations of each
+#much faster to use this vectorised approach than looping through
+annotateGenomeWide <- function(mqtlResults,cpg_locs,snp_locs){
+  
+  cpgs <- mqtlResults$gene
+  snps <- mqtlResults$CHRPOSID
+  
+  #get the cpg and snp positions
+  snpPos <- snp_locs[match(snps,snp_locs$snp),]
+  cpgPos <- cpg_locs[match(cpgs,cpg_locs$snp),]
+  
+  distances <- abs(snpPos$pos - cpgPos$pos)
+
+  mqtlResults$SNP_chr <- snpPos$chr
+  mqtlResults$SNP_pos <- snpPos$pos
+  mqtlResults$CpG_chr <- cpgPos$chr
+  mqtlResults$CpG_position <- cpgPos$pos
+  mqtlResults$Distance <- distances
+  
+  annots <- c("hg19_genes_intergenic","hg19_basicgenes")
+
+  annotations <- build_annotations(genome = 'hg19', annotations = annots)
+  
+  
+  mqtlResults$CpG_nearest <- getNearestProtein(mqtlResults[,c("CpG_chr","CpG_position","CpG_position")])
+  mqtlResults$CpG_region <- getGenomicRegionType(mqtlResults[,c("CpG_chr","CpG_position","CpG_position")],annotations)
+  
+  mqtlResults$OA_SNP_nearest <- getNearestProtein(mqtlResults[,c("SNP_chr","SNP_pos","SNP_pos")])
+  mqtlResults$OA_SNP_region <- getGenomicRegionType(mqtlResults[,c("SNP_chr","SNP_pos","SNP_pos")],annotations)
+ 
+  
+  return(mqtlResults)
+
+}
+
+#get the distances from the sig mqtls
+sig.dist_cis.all.me<- annotateGenomeWide(datasets$sig.dist_cis.all.me,imp.meth_loc.df,imp.snp_loc.df)
+
+#check that the distances are as expected
+expect_true(max(sig.dist_cis.all.me$Distance) <= cisDist)
+```
+## Get the coloc results
+```{r}
+#No need to annotate the coloc results as just need the SNP chr and pos which the SNP id has
+
+dist_cis.coloc.me <- coloc.dist.me$cis$eqtls
+
+
+#get the distances from the sig mqtls
+# dist_cis.coloc.me<- annotateGenomeWide(dist_cis.coloc.me,imp.meth_loc.df,imp.snp_loc.df)
+
+dist_cis.coloc.me <- merge(imp.meth_annot.df[,c("Name","chr","pos")], 
+                      dist_cis.coloc.me, by.x="Name", by.y="gene")
+
+colnames(dist_cis.coloc.me)[1:3] <- c("CpG","CpG_chr","CpG_position")
+
+string <- strsplit(dist_cis.coloc.me$snps,split=":")
+dist_cis.coloc.me$SNP_chr <- sapply(string,"[[",1)
+dist_cis.coloc.me$SNP_pos <- sapply(string,"[[",2)
+
+```
+### Read in OA SNPs
+
+```{r}
+# Read in 
+oa_snps <- read.table(paste0(data_dir,"/efotraits_MONDO_0005178-associations-2023-05-5.csv"), sep=",", header=TRUE, quote="\"")
+
+# Sort out p-value column
+oa_snps$P.value <- as.numeric(gsub(" x 10", "e",oa_snps$P.value))
+
+# Sort out ID and chrms as new columns
+oa_snps["Variant"] <- gsub("-[<].*","",oa_snps$Variant.and.risk.allele)
+oa_snps["Allele"] <- gsub(".*-[<]","<",oa_snps$Variant.and.risk.allele)
+oa_snps["chr"] <- paste0("chr",gsub(":.*","",oa_snps$Location))
+oa_snps["pos"] <- as.numeric(gsub(".*:","",oa_snps$Location))
+
+# Remove unavailable mapping
+oa_snps <- oa_snps[!grepl("Mapping",oa_snps$chr),]
+
+# Remove duplicates
+oa_snps <- oa_snps[!duplicated(oa_snps$Variant),]
+rownames(oa_snps) <- oa_snps$Variant
+
+# Count duplicates
+head(sort(table(oa_snps$Variant), decreasing=TRUE))
+
+```
+
+## Overlap the OA SNPs with the genome wide mQTL results
+
+```{r}
+
+sig.dist_cis.all.me_OA <- sig.dist_cis.all.me[ sig.dist_cis.all.me$SNP %in% oa_snps$Variant,]
+
+```
+
+
+### Plot mQTL result
+
+```{r}
+
+PlotmQTLs <- function(snp_data, meth_data, mqtl_data, plink_data,genotype_colors, folder_name, snp_name="OA_SNP") {
+
+  # Make tall
+  tall.snp_data <- data.frame(reshape2::melt(snp_data, id.vars="id")); tall.snp_data$variable <- gsub("^X","",tall.snp_data$variable)
+  tall.meth_data <- data.frame(reshape2::melt(meth_data, id.vars="id")); tall.meth_data$variable <- as.character(tall.meth_data$variable)
+  
+  # Filter to keep sig mqtls
+  tall.snp_data <- tall.snp_data[which(tall.snp_data$id %in% mqtl_data[[snp_name]]),]
+  tall.meth_data <- tall.meth_data[which(tall.meth_data$id %in% mqtl_data$CpG),]
+  
+
+  # Combine
+  tall_data <- merge(tall.snp_data, tall.meth_data, by="variable")
+  colnames(tall_data) <- c("Patient", "CHRPOSID", "Genotype","CpG","Beta")
+
+  # Add mqtl column
+    tall_data["mQTL"] <- paste(tall_data$CHRPOSID, tall_data$CpG, sep="_")
+    mqtl_data$chrpos_cpg <-  paste(mqtl_data[,snp_name], mqtl_data$CpG, sep="_")
+    
+    tall_data <- merge(tall_data,mqtl_data,by.x="mQTL",by.y="chrpos_cpg")
+  
+    tall_data$Genotype <- as.character(tall_data$Genotype)
+  
+  # Loop over
+  for (mqtl in unique(tall_data$mqtl)) {
+    
+    # Subset data
+    mqtl_data <- tall_data[tall_data$mqtl == mqtl,]
+    
+    mqtl_data <- mqtl_data[!is.na(mqtl_data$Genotype) & !is.na(mqtl_data$Beta),]
+    
+    # Get missing genotypes
+    missing_genotypes <- names(genotype_colors)[!names(genotype_colors) %in% unique(mqtl_data$Genotype)]
+    if (length(missing_genotypes) > 0) {
+    
+      # Add in missing genotypes
+      mqtl_data$Genotype <- factor(mqtl_data$Genotype, levels=names(genotype_colors))
+      
+    }
+    
+ 
+    minor <- plink_data[plink_data$CHRPOSID==unique(mqtl_data$CHRPOSID),"alt"]
+    major <- plink_data[plink_data$CHRPOSID==unique(mqtl_data$CHRPOSID),"ref"]
+  
+    
+    mqtl_data<- mqtl_data %>% mutate(Genotype_letters=case_when(
+  Genotype == 2 ~ paste(major,major,sep="/"),
+  Genotype == 1 ~ paste(major,minor,sep="/"),
+    Genotype == 0 ~ paste(minor,minor,sep="/"),
+))
+    
+   mqtl_data$Genotype <- as.factor(mqtl_data$Genotype)
+    
+    # Plot
+    plt <- ggplot(mqtl_data, aes(x = fct_reorder(Genotype_letters, as.numeric(Genotype)), y=Beta, fill=Genotype, group=Genotype_letters)) + 
+           geom_violin(alpha=0.65) + scale_fill_manual(values=genotype_colors) +
+           geom_boxplot(width=0.065, fill="white") +
+           geom_jitter(shape=21, width = 0.175) +
+           labs(title=mqtl) +
+           theme_bw(base_size=16) + 
+           theme(axis.title=element_text(size=28),
+                 plot.title=element_text(size=32),
+                 legend.position = "none") +
+          xlab("Genotype")
+    
+    # Create folder
+    dir.create(folder_name, recursive=TRUE, showWarnings=FALSE)
+    
+    # Save
+    ggsave(gsub("[:]cg","-cg",paste0(folder_name, mqtl, ".betavals.by_genotype.png")), plt, units="px", width=4000, height=3000)
+    
+  }
+
+}
+
+# Genotype colours
+genotype_colors <- c("skyblue","mediumpurple","salmon")
+names(genotype_colors) <- c("0","1","2")
+
+# Read in metadata
+metadata <- read.table(paste0(res_dir,"methylation_sample_metadata.tsv"), sep="\t", header=TRUE)
+
+
+meth_beta <- read.table(paste0(res_dir,"methylation_matrix.betavals.tsv"), sep="\t", header=TRUE)
+colnames(meth_beta)[1] <- "id"
+colnames(meth_beta) <- gsub("^X","",colnames(meth_beta))
+
+# plink_data.df <- readRDS(paste0(imp_dir,"all_individuals.merged.q_filt.df.RDS"))
+imput_data.df <- readRDS(paste0(imp_dir,"imputed.hrc.read_into_R.rds"))
+
+
+
+topN=20
+
+
+# Plot mQTL Beta vs genotype plots
+
+## Genome wide
+#select the top CpGs to plot as examples
+chosenMQTLs <- sig.dist_cis.all.me %>% group_by(gene) %>% slice_head(n = 1) %>% ungroup() %>% slice_min(order_by = pvalue,n = topN) %>% as.data.frame()
+colnames(imput_data.df) <- gsub("^X","",colnames(imput_data.df))
+colnames(chosenMQTLs)[1] <- "OA_SNP_CHRPOSID"
+
+rownames(imput_data.df) <- imput_data.df$marker
+snpData <- imput_data.df[imput_data.df$marker %in% chosenMQTLs$OA_SNP_CHRPOSID ,as.character(metadata$Sample_Name)]
+ids <- rownames(snpData)
+
+#reorder alleles to be minor allele additive
+reorderAlleles <- function(x){
+  
+  x <- ifelse(x == 2, 0,
+                          ifelse(x== 0,2,1 ))
+  return(x)
+
+}
+# snpData <- as.data.frame(reorderAlleles(snpData))
+
+snpData$id <- ids
+colnames(chosenMQTLs)[2] <- "CpG"
+
+PlotmQTLs(snpData, 
+          meth_beta[which(meth_beta$id %in% as.character(rownames(imp.meth_annot.df))),], 
+          chosenMQTLs,imput_data.df, genotype_colors, paste0(mqtl_dir, "genomewide/"), snp_name="OA_SNP_CHRPOSID")
+
+
+
+```
+
+## Write out the genotype values for all the significant mQTLs
+```{r}
+
+#genome wide
+colnames(imput_data.df) <- gsub("^X","",colnames(imput_data.df))
+
+genotypes.genomewide <- data.frame(id=imput_data.df$CHRPOSID,imput_data.df[,as.character(metadata$Sample_Name)])
+genotypes.genomewide <- genotypes.genomewide[ genotypes.genomewide$id %in% sig.dist_cis.all.me$CHRPOSID,]
+write.table(genotypes.genomewide,file=paste0(mqtl_dir, "genomewide/genotypes.txt"),col.names=T,row.names=F,sep="\t",quote=F)
+
+
+```
+## Write out the beta values for all the significant mQTLs
+
+```{r}
+##genome wide
+cpgs.genomewide <- meth_beta[which(meth_beta$id %in% as.character(rownames(imp.meth_annot.df))),]
+cpgs.genomewide <- cpgs.genomewide[ cpgs.genomewide$id %in% sig.dist_cis.all.me$gene,]
+write.table(cpgs.genomewide,file=paste0(mqtl_dir, "genomewide/cpgs.txt"),col.names=T,row.names=F,sep="\t",quote=F)
+
+
+```
+
+
+
+## write out the mqtl results tables
+
+```{r}
+
+##genome wide
+write.table(sig.dist_cis.all.me, paste0(mqtl_dir,"mqtl_analysis.cis_mqtls.genomewide.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+write.table(sig.dist_cis.all.me_OA, paste0(mqtl_dir,"mqtl_analysis.cis_mqtls.genomewide.OA.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+#coloc
+
+dist_cis.coloc.me <- dist_cis.coloc.me[dist_cis.coloc.me$beta != 0,]
+write.table(dist_cis.coloc.me, paste0(mqtl_dir,"mqtl_analysis.cis_mqtls.coloc.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+```
+
+
+## sessionInfo
+
+```{r}
+writeLines(capture.output(sessionInfo()), paste0(log_dir,"mQTL_sessionInfo.txt"))
+```
+

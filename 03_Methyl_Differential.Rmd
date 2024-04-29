@@ -1,0 +1,1305 @@
+---
+title: "Methylation - Differential methylation & DMRs"
+format: html
+---
+
+## Notes
+
+### Meta analysis
+
+-   Inverse variance weighting allows for correlated variables to be combined.
+
+## Code
+
+### Libraries
+
+```{r}
+
+# Plotting and graphics
+library(ggplot2)
+library(RColorBrewer)
+library(scales)
+library(colorspace)
+
+# Data QC 
+library(wateRmelon)
+library(DNAmArray)
+library(minfi)
+library(maxprobes)
+
+# Annotation
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+
+# Programming, parsing and data wrangling
+library(mgsub)
+library(GenomicFeatures)
+#library(doSNOW) # parallel processes on Windows
+library(foreach)
+library(RcppEigen) # For faster lm 
+library(GenomicRanges)
+
+# Statistics and analyses
+library(limma)
+library(factoextra)
+library(sva)
+library(pvca)
+library(dmrff)
+library(DMRcate)
+
+# Gene ontology
+library(clusterProfiler)
+#library(methylGSA)
+
+```
+
+### Parameters
+
+```{r}
+#set the treat log2 treshold
+trt_log2fc_thr <- 0.1
+maxgap_val <- 1000
+
+```
+
+### Directories
+
+```{r}
+
+# Defined main dir
+scripts_dir <- getwd()
+main_dir <- paste0(scripts_dir, "/methylation/")
+data_dir <- paste0(scripts_dir, "/rawdata/")
+res_dir <- paste0(scripts_dir, "/results/")
+pca_dir <- paste0(scripts_dir, "/pca/")
+dmr_dir <- paste0(res_dir, "/dmr/")
+de_dir <- paste0(scripts_dir, "/differential_methylation/")
+gocpg_dir <- paste0(de_dir, "go/")
+godmr_dir <- paste0(dmr_dir, "go/")
+util_dir <- paste0(scripts_dir, "/utilities/")
+log_dir <- paste0(scripts_dir, "/logs/")
+
+# Ensure outputs are created
+x <- suppressMessages(sapply(c(dmr_dir, gocpg_dir, godmr_dir), dir.create, recursive=TRUE, showWarnings=FALSE)); rm(x)
+
+```
+
+### Source R scripts
+
+```{r}
+
+# Source script that sources files
+source("install/source_rscripts.R")
+
+# Source relevant scripts
+SourceExternalScripts(paste0(util_dir, "R/"), "*.R$", ignore.case=FALSE)
+
+```
+
+## Read in the preprocessed data
+
+```{r}
+
+preProccessedData <- readRDS(paste0(data_dir,"preproccessed_methyl.RDS"))
+qnt.mSetSqFlt <- preProccessedData$qnt.mSetSqFlt
+fun.mSetSqFlt <- preProccessedData$fun.mSetSqFlt
+metadata <- preProccessedData$metadata
+
+# Get M-normalised matrix
+## Quantile
+qnt.m_mat <- minfi::getM(qnt.mSetSqFlt)
+qnt.m_mat <- as.matrix(na.omit(qnt.m_mat))
+qnt.m_mat <- qnt.m_mat[order(rowVars(qnt.m_mat), decreasing=TRUE),]
+
+# Load data
+data(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+annotdata <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+
+
+```
+
+#### Prep design/metadata
+
+```{r}
+
+# Make factor names match
+for_de.metadata <- metadata
+for_de.metadata["BMI_GROUP"] <- gsub(" ","_",for_de.metadata$BMI_GROUP)
+for_de.metadata["Batch"] <- paste0("B_",for_de.metadata$Batch)
+
+# Scale data
+for_de.metadata["Z_STAGE_WEEKS"] <- scale(for_de.metadata$stage_weeks, scale=TRUE, center=TRUE)
+for_de.metadata["Z_MAT_BMI"] <- scale(for_de.metadata$mat_bmi, scale=TRUE, center=TRUE)
+for_de.metadata["Z_MAT_AGE"] <- scale(for_de.metadata$mat_age, scale=TRUE, center=TRUE)
+  
+# Set up design matrix
+bmigroup.design <- model.matrix(~ 0 + BMI_GROUP + Z_STAGE_WEEKS + sex + Batch + Z_MAT_AGE, data=for_de.metadata)
+trigroup.design <- model.matrix(~ 0 + TRIMESTER + Z_MAT_BMI + Z_STAGE_WEEKS + sex + Batch + Z_MAT_AGE, data=for_de.metadata)
+bmicont.design <- model.matrix(~ 0 + sex + Batch + Z_MAT_BMI + Z_STAGE_WEEKS + Z_MAT_AGE, data=for_de.metadata)
+bmibinary.design <- model.matrix(~ 0 + BMI_BINARY + Z_STAGE_WEEKS + sex + Batch + Z_MAT_AGE, data=for_de.metadata)
+bmicontinteract.design <- model.matrix(~ 0 + Z_MAT_BMI + Z_STAGE_WEEKS + Batch + sex + Z_MAT_AGE + sex:Z_STAGE_WEEKS, data=for_de.metadata)
+colnames(bmigroup.design) <- gsub("BMI_GROUP|Batch|sex","",colnames(bmigroup.design))
+colnames(trigroup.design) <- gsub("TRIMESTER|BMI_GROUP|Batch|sex","",colnames(trigroup.design))
+
+
+```
+
+#### Probe-wise
+
+For Treat method and ref for below statements, see: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2654802/
+
+Treat method tests for LFC \> a threshold, rather than 0.
+
+Note that a low threshold needs to be chosen as the method requires that LFCs be significantly different from this, so the effective threshold would likely be greater than it.
+
+Returned p-values are slightly conservative, due to it innately testing a composite NH. Therefore FDR is likely to be better than the rate returned by the p-values. However this means that the NH p-value distribution doesn't follow strict uniformity and is biased towards larger values. This means that while BH adjustment is still viable, some aren't (ie https://academic.oup.com/jrsssb/article/67/4/555/7110602).
+
+```{r}
+
+# Make contrast matrix
+## BMI as categorical groupings
+bmigroup.contMatrix <- makeContrasts(Extremely_Obese-Obese,
+                                     Extremely_Obese-Overweight,
+                                     Extremely_Obese-Normal,
+                                     Extremely_Obese-Underweight,
+                                     Obese-Overweight,
+                                     Obese-Normal,
+                                     Obese-Underweight,
+                                     Overweight-Normal,
+                                     Overweight-Underweight,
+                                     Normal-Underweight,
+                                     levels=bmigroup.design)
+
+## BMI as binary
+colnames(bmibinary.design) <- gsub("BMI_BINARY","",colnames(bmibinary.design))
+bmibinary.contMatrix <- makeContrasts(High-Low,
+                                      levels=bmibinary.design)
+
+## Continuous covariates
+bmicont.contMatrix <- makeContrasts(Z_MAT_AGE,
+                                    Z_MAT_BMI,
+                                    Z_STAGE_WEEKS,
+                                    sexmale-sexfemale,
+                                    levels=bmicont.design)
+rownames(bmicont.contMatrix) <- gsub("Intercept","(Intercept)",rownames(bmicont.contMatrix))
+
+## Trimesters (stage in weeks as categorical)
+trigroup.contMatrix <- makeContrasts(Second-First,
+                                     levels=trigroup.design)
+
+# Fit lm
+bmigroup.fit <- lmFit(qnt.m_mat[,rownames(bmigroup.design)], bmigroup.design)
+trigroup.fit <- lmFit(qnt.m_mat[,rownames(trigroup.design)], trigroup.design)
+bmicont.fit <- lmFit(qnt.m_mat[,rownames(bmicont.design)],bmicont.design)
+bmibinary.fit <- lmFit(qnt.m_mat[,rownames(bmibinary.design)],bmibinary.design)
+
+# fit the contrasts
+bmigroup.fit <- contrasts.fit(bmigroup.fit, bmigroup.contMatrix)
+trigroup.fit <- contrasts.fit(trigroup.fit, trigroup.contMatrix)
+bmicont.fit <- contrasts.fit(bmicont.fit, bmicont.contMatrix)
+bmibinary.fit <- contrasts.fit(bmibinary.fit, bmibinary.contMatrix)
+
+# Shrink variance
+eby.bmigroup.fit <- eBayes(bmigroup.fit, trend=FALSE, robust=TRUE)
+eby.trigroup.fit <- eBayes(trigroup.fit, trend=FALSE, robust=TRUE)
+eby.bmicont.fit <- eBayes(bmicont.fit, trend=FALSE, robust=TRUE)
+eby.bmibinary.fit <- eBayes(bmibinary.fit, trend=FALSE, robust=TRUE)
+
+# Treat variance (ie lfc > 0)
+trt.bmigroup.fit <- treat(bmigroup.fit, lfc=trt_log2fc_thr)
+trt.trigroup.fit <- treat(trigroup.fit, lfc=trt_log2fc_thr)
+trt.bmicont.fit <- treat(bmicont.fit, lfc=trt_log2fc_thr)
+trt.bmibinary.fit <- treat(bmibinary.fit, lfc=trt_log2fc_thr)
+
+```
+
+### Polynomial regression
+
+```{r}
+
+# Transform coefficients
+for_de.metadata["POLY_2_Z_MAT_BMI"] <- scale(for_de.metadata$mat_bmi^2, scale=TRUE, center=TRUE)
+for_de.metadata["POLY_3_Z_MAT_BMI"] <- scale(for_de.metadata$mat_bmi^3, scale=TRUE, center=TRUE)
+  
+# Set up design matrix
+poly2.design <- model.matrix(~ 0 + poly(mat_bmi,2) + Batch + Z_STAGE_WEEKS + sex + Z_MAT_AGE, data=for_de.metadata)
+poly3.design <- model.matrix(~ 0 + poly(mat_bmi,3) + Batch + Z_STAGE_WEEKS + sex + Z_MAT_AGE, data=for_de.metadata)
+colnames(poly2.design)[1:2] <- c("POLY_2_MAT_BMI_1ST","POLY_2_MAT_BMI_2ND")
+colnames(poly3.design)[1:3] <- c("POLY_3_MAT_BMI_1ST","POLY_3_MAT_BMI_2ND","POLY_3_MAT_BMI_3RD")
+
+## Continuous covariates (polynomial)
+poly2.contMatrix <- makeContrasts(POLY_2_MAT_BMI_1ST,
+                                  POLY_2_MAT_BMI_2ND,
+                                  levels=poly2.design)
+rownames(poly2.contMatrix) <- gsub("Intercept","(Intercept)",rownames(poly2.contMatrix))
+poly3.contMatrix <- makeContrasts(POLY_3_MAT_BMI_1ST,
+                                  POLY_3_MAT_BMI_2ND,
+                                  POLY_3_MAT_BMI_3RD,
+                                  levels=poly3.design)
+rownames(poly3.contMatrix) <- gsub("Intercept","(Intercept)",rownames(poly3.contMatrix))
+
+# Fit
+poly2.fit <- lmFit(qnt.m_mat[,rownames(poly2.design)], poly2.design)
+poly3.fit <- lmFit(qnt.m_mat[,rownames(poly3.design)], poly3.design)
+
+# Shrink variance
+eby.poly2.fit <- eBayes(poly2.fit, trend=FALSE, robust=TRUE)
+eby.poly3.fit <- eBayes(poly3.fit, trend=FALSE, robust=TRUE)
+
+# Treat variance (ie lfc > 0)
+trt.poly2.fit <- treat(poly2.fit, lfc=trt_log2fc_thr)
+trt.poly3.fit <- treat(poly3.fit, lfc=trt_log2fc_thr)
+
+```
+
+### Get limma results
+
+```{r}
+
+# Get sig results
+## Non-treat filtered
+probes.eby.bmigroup.df <- GetLimmaResults(eby.bmigroup.fit, bmigroup.contMatrix, annotdata)
+probes.eby.trigroup.df <- GetLimmaResults(eby.trigroup.fit, trigroup.contMatrix, annotdata)
+probes.eby.bmicont.df <- GetLimmaResults(eby.bmicont.fit, bmicont.contMatrix, annotdata)
+probes.eby.bmibinary.df <- GetLimmaResults(eby.bmibinary.fit, bmibinary.contMatrix, annotdata)
+ 
+## Treat-filtered (abs log2FC > n)
+probes.trt.bmigroup.df <- GetLimmaResults(trt.bmigroup.fit, bmigroup.contMatrix, annotdata, trt_toggle=TRUE)
+probes.trt.trigroup.df <- GetLimmaResults(trt.trigroup.fit, trigroup.contMatrix, annotdata, trt_toggle=TRUE)
+probes.trt.bmicont.df <- GetLimmaResults(trt.bmicont.fit, bmicont.contMatrix, annotdata, trt_toggle=TRUE)
+probes.trt.bmibinary.df <- GetLimmaResults(trt.bmibinary.fit, bmibinary.contMatrix, annotdata, trt_toggle=TRUE)
+
+## Polynomial
+probes.eby.poly2.df <- GetLimmaResults(eby.poly2.fit, poly2.contMatrix, annotdata)
+probes.eby.poly3.df <- GetLimmaResults(eby.poly3.fit, poly3.contMatrix, annotdata)
+
+```
+
+### Annotate to genes
+
+```{r}
+
+# Get sig results
+## Non-treat filtered
+probes.eby.bmigroup.df  <- cbind(probes.eby.bmigroup.df, 
+                                 annotateGenes(data.frame(chr=probes.eby.bmigroup.df$chr, start=probes.eby.bmigroup.df$pos, end=probes.eby.bmigroup.df$pos))[,c("SYMBOL","DISTANCE")])
+probes.eby.trigroup.df  <- cbind(probes.eby.trigroup.df, 
+                                 annotateGenes(data.frame(chr=probes.eby.trigroup.df$chr, start=probes.eby.trigroup.df$pos, end=probes.eby.trigroup.df$pos))[,c("SYMBOL","DISTANCE")])
+probes.eby.bmicont.df   <- cbind(probes.eby.bmicont.df, 
+                                 annotateGenes(data.frame(chr=probes.eby.bmicont.df$chr, start=probes.eby.bmicont.df$pos, end=probes.eby.bmicont.df$pos))[,c("SYMBOL","DISTANCE")])
+probes.eby.bmibinary.df <- cbind(probes.eby.bmicont.df, 
+                                 annotateGenes(data.frame(chr=probes.eby.bmibinary.df$chr, start=probes.eby.bmibinary.df$pos, end=probes.eby.bmibinary.df$pos))[,c("SYMBOL","DISTANCE")])
+
+## Treat-filtered (abs log2FC > n)
+probes.trt.bmigroup.df  <- cbind(probes.trt.bmigroup.df, 
+                                 annotateGenes(data.frame(chr=probes.trt.bmigroup.df$chr, start=probes.trt.bmigroup.df$pos, end=probes.trt.bmigroup.df$pos))[,c("SYMBOL","DISTANCE")])
+probes.trt.trigroup.df  <- cbind(probes.trt.trigroup.df, 
+                                 annotateGenes(data.frame(chr=probes.trt.trigroup.df$chr, start=probes.trt.trigroup.df$pos, end=probes.trt.trigroup.df$pos))[,c("SYMBOL","DISTANCE")])
+probes.trt.bmicont.df   <- cbind(probes.trt.bmicont.df, 
+                                 annotateGenes(data.frame(chr=probes.trt.bmicont.df$chr, start=probes.trt.bmicont.df$pos, end=probes.trt.bmicont.df$pos))[,c("SYMBOL","DISTANCE")])
+probes.trt.bmibinary.df <- cbind(probes.trt.bmicont.df, 
+                                 annotateGenes(data.frame(chr=probes.trt.bmibinary.df$chr, start=probes.trt.bmibinary.df$pos, end=probes.trt.bmibinary.df$pos))[,c("SYMBOL","DISTANCE")])
+
+```
+
+### Check n sig probes of interest
+
+```{r}
+
+nrow(probes.trt.bmicont.df[probes.trt.bmicont.df$adj.P.Val < 0.001 & !is.na(probes.trt.bmicont.df$adj.P.Val) & probes.trt.bmicont.df$CONTRAST == "Z_STAGE_WEEKS",])
+nrow(probes.eby.bmicont.df[probes.eby.bmicont.df$adj.P.Val < 0.05 & !is.na(probes.eby.bmicont.df$adj.P.Val) & probes.eby.bmicont.df$CONTRAST == "sexmale - sexfemale",])
+
+```
+
+### Get mean sex CpG
+
+```{r}
+
+# Get Beta values
+qnt.beta_mat <- data.frame(minfi::getBeta(qnt.mSetSqFlt))
+
+# Get male/female samples
+maleSamples <- as.character(metadata[metadata$sex == "male",]$Sample_Name)
+femaleSamples <- as.character(metadata[metadata$sex == "female",]$Sample_Name)
+
+# Make tall
+tall_qnt.beta_mat <- melt(cbind(CPG=rownames(qnt.beta_mat), qnt.beta_mat), id.vars="CPG")
+tall_qnt.beta_mat$variable <- gsub("X","",tall_qnt.beta_mat$variable)
+
+# aggregate mean CpG
+meanMaleBeta   <- aggregate(. ~ CPG, 
+                            data=tall_qnt.beta_mat[which(tall_qnt.beta_mat$variable %in% maleSamples),-2],
+                            FUN=mean)
+meanFemaleBeta <- aggregate(. ~ CPG, 
+                            data=tall_qnt.beta_mat[which(tall_qnt.beta_mat$variable %in% femaleSamples),-2],
+                            FUN=mean)
+meanBeta <- cbind(meanMaleBeta, meanFemaleBeta[,-1,drop=FALSE])
+colnames(meanBeta) <- c("CpG","MeanMale","MeanFemale")
+
+# Combine
+probes.eby.bmicont.df <- merge(probes.eby.bmicont.df, meanBeta, by.x="Name", by.y="CpG")
+probes.trt.bmicont.df <- merge(probes.trt.bmicont.df, meanBeta, by.x="Name", by.y="CpG")
+
+```
+
+### Save
+
+```{r}
+
+# Save
+write.table(probes.eby.bmigroup.df, paste0(de_dir, "differential_methylation.limma_results.bmi_groups.ebayes_adjusted.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.eby.trigroup.df, paste0(de_dir, "differential_methylation.limma_results.trimester_groups.ebayes_adjusted.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.eby.bmicont.df, paste0(de_dir, "differential_methylation.limma_results.continuous_covariates.ebayes_adjusted.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.eby.bmibinary.df, paste0(de_dir, "differential_methylation.limma_results.binarised_bmi.ebayes_adjusted.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+write.table(probes.trt.bmigroup.df, paste0(de_dir, "differential_methylation.limma_results.bmi_groups.treat_log2FC",trt_log2fc_thr,"_thr.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.trt.trigroup.df, paste0(de_dir, "differential_methylation.limma_results.trimester_groups.treat_log2FC",trt_log2fc_thr,"_thr.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.trt.bmicont.df, paste0(de_dir, "differential_methylation.limma_results.continuous_covariates.treat_log2FC",trt_log2fc_thr,"_thr.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.trt.bmibinary.df, paste0(de_dir, "differential_methylation.limma_results.binarised_bmi.treat_log2FC",trt_log2fc_thr,"_thr.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+# Save
+write.table(probes.eby.bmigroup.df[probes.eby.bmigroup.df$adj.P.Val < 0.05 & !is.na(probes.eby.bmigroup.df$adj.P.Val),], 
+            paste0(de_dir, "differential_methylation.limma_results.bmi_groups.ebayes_adjusted.padj_thr",0.05,".tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.eby.trigroup.df[probes.eby.trigroup.df$adj.P.Val < 0.05 & !is.na(probes.eby.trigroup.df$adj.P.Val),], 
+            paste0(de_dir, "differential_methylation.limma_results.trimester_groups.ebayes_adjusted.padj_thr",0.05,".tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.eby.bmicont.df[probes.eby.bmicont.df$adj.P.Val < 0.05 & !is.na(probes.eby.bmicont.df$adj.P.Val),], 
+            paste0(de_dir, "differential_methylation.limma_results.continuous_covariates.ebayes_adjusted.padj_thr",0.05,".tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.eby.bmibinary.df[probes.eby.bmibinary.df$adj.P.Val < 0.05 & !is.na(probes.eby.bmibinary.df$adj.P.Val),], 
+            paste0(de_dir, "differential_methylation.limma_results.binarised_bmi.ebayes_adjusted.padj_thr",0.05,".tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+write.table(probes.eby.bmigroup.df[probes.eby.bmigroup.df$adj.P.Val < 0.01 & !is.na(probes.eby.bmigroup.df$adj.P.Val),], 
+            paste0(de_dir, "differential_methylation.limma_results.bmi_groups.ebayes_adjusted.padj_thr",0.01,".tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.eby.trigroup.df[probes.eby.trigroup.df$adj.P.Val < 0.01 & !is.na(probes.eby.trigroup.df$adj.P.Val),], 
+            paste0(de_dir, "differential_methylation.limma_results.trimester_groups.ebayes_adjusted.padj_thr",0.01,".tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.eby.bmicont.df[probes.eby.bmicont.df$adj.P.Val < 0.01 & !is.na(probes.eby.bmicont.df$adj.P.Val),], 
+            paste0(de_dir, "differential_methylation.limma_results.continuous_covariates.ebayes_adjusted.padj_thr",0.01,".tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.eby.bmibinary.df[probes.eby.bmibinary.df$adj.P.Val < 0.01 & !is.na(probes.eby.bmibinary.df$adj.P.Val),], 
+            paste0(de_dir, "differential_methylation.limma_results.binarised_bmi.ebayes_adjusted.padj_thr",0.01,".tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+write.table(probes.trt.bmigroup.df[probes.trt.bmigroup.df$adj.P.Val < 0.001 & !is.na(probes.trt.bmigroup.df$adj.P.Val),], 
+            paste0(de_dir, "differential_methylation.limma_results.bmi_groups.treat_log2FC",trt_log2fc_thr,"_thr.padj_thr",0.001,".tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.trt.trigroup.df[probes.trt.trigroup.df$adj.P.Val < 0.001 & !is.na(probes.trt.trigroup.df$adj.P.Val),], 
+            paste0(de_dir, "differential_methylation.limma_results.trimester_groups.treat_log2FC",trt_log2fc_thr,"_thr.padj_thr",0.001,".tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.trt.bmicont.df[probes.trt.bmicont.df$adj.P.Val < 0.001 & !is.na(probes.trt.bmicont.df$adj.P.Val),], 
+            paste0(de_dir, "differential_methylation.limma_results.continuous_covariates.treat_log2FC",trt_log2fc_thr,"_thr.padj_thr",0.001,".tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.trt.bmibinary.df[probes.trt.bmibinary.df$adj.P.Val < 0.001 & !is.na(probes.trt.bmibinary.df$adj.P.Val),], 
+            paste0(de_dir, "differential_methylation.limma_results.binarised_bmi.treat_log2FC",trt_log2fc_thr,"_thr.padj_thr",0.001,".tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+```
+
+### Save desired
+
+```{r}
+
+# Save
+## Tables - NOTE that these are for overlapping with DMRs
+write.table(probes.eby.bmicont.df[probes.eby.bmicont.df$CONTRAST == "sexmale - sexfemale",], 
+            paste0(de_dir, "differential_methylation.limma_results.sex.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.trt.bmicont.df[probes.trt.bmicont.df$CONTRAST == "Z_STAGE_WEEKS",], 
+            paste0(de_dir, "differential_methylation.limma_results.stage_as_continuous.treat_log2FC",trt_log2fc_thr,"_thr.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.eby.bmicont.df[probes.eby.bmicont.df$CONTRAST == "sexmale - sexfemale" & probes.eby.bmicont.df$adj.P.Val < 0.05,], 
+            paste0(de_dir, "differential_methylation.limma_results.sex.padj",0.05,".tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(probes.trt.bmicont.df[probes.trt.bmicont.df$CONTRAST == "Z_STAGE_WEEKS" & probes.trt.bmicont.df$adj.P.Val < 0.001,],
+            paste0(de_dir, "differential_methylation.limma_results.stage_as_continuous.treat_log2FC",trt_log2fc_thr,"_thr.padj",0.001,".tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+
+## Bed
+write.table(probes.eby.bmicont.df[probes.eby.bmicont.df$CONTRAST == "sexmale - sexfemale",c("chr","pos","pos","Name")], 
+            paste0(de_dir, "differential_methylation.limma_results.sex.bed"), sep="\t", quote=FALSE, row.names=FALSE, col.names=FALSE)
+write.table(probes.trt.bmicont.df[probes.trt.bmicont.df$CONTRAST == "Z_STAGE_WEEKS",c("chr","pos","pos","Name")], 
+            paste0(de_dir, "differential_methylation.limma_results.stage_as_continuous.treat_log2FC",trt_log2fc_thr,"_thr.bed"), sep="\t", quote=FALSE, row.names=FALSE, col.names=FALSE)
+write.table(probes.eby.bmicont.df[probes.eby.bmicont.df$CONTRAST == "sexmale - sexfemale"& probes.eby.bmicont.df$adj.P.Val < 0.05,c("chr","pos","pos","Name")], 
+            paste0(de_dir, "differential_methylation.limma_results.sex.padj",0.05,".bed"), sep="\t", quote=FALSE, row.names=FALSE, col.names=FALSE)
+write.table(probes.trt.bmicont.df[probes.trt.bmicont.df$CONTRAST == "Z_STAGE_WEEKS"& probes.trt.bmicont.df$adj.P.Val < 0.001,c("chr","pos","pos","Name")], 
+            paste0(de_dir, "differential_methylation.limma_results.stage_as_continuous.treat_log2FC",trt_log2fc_thr,"_thr.padj",0.001,".bed"), sep="\t", quote=FALSE, row.names=FALSE, col.names=FALSE)
+
+```
+
+### Volcano plots
+
+```{r}
+
+# Plot nice volcano plots
+NiceVolcanoPlots(probes.eby.bmicont.df, comparison="CONTRAST", dir=de_dir, pval_colname="adj.P.Val", logfc_colname="logFC", feature_colname="Name", 
+                 padj_thr=0.05, label_sig_thr=1e-100, topn_genes=0, logfc_thr=0.1, fills=c(NA,NA,NA), colours=c("lightgrey", "#BB5566", "#004488"), extra_filename="nonlogFC_thresholded")
+NiceVolcanoPlots(probes.eby.bmigroup.df, comparison="CONTRAST", dir=de_dir, pval_colname="adj.P.Val", logfc_colname="logFC", feature_colname="Name", 
+                 padj_thr=0.05, label_sig_thr=1e-100, topn_genes=0, logfc_thr=0.1, fills=c(NA,NA,NA), colours=c("lightgrey", "#BB5566", "#004488"), extra_filename="nonlogFC_thresholded")
+NiceVolcanoPlots(probes.eby.trigroup.df, comparison="CONTRAST", dir=de_dir, pval_colname="adj.P.Val", logfc_colname="logFC", feature_colname="Name", 
+                 padj_thr=0.05, label_sig_thr=1e-100, topn_genes=0, logfc_thr=0.1, fills=c(NA,NA,NA), colours=c("lightgrey", "#BB5566", "#004488"), extra_filename="nonlogFC_thresholded")
+
+# Plot nice volcano plots
+NiceVolcanoPlots(probes.trt.bmicont.df, comparison="CONTRAST", dir=de_dir, pval_colname="adj.P.Val", logfc_colname="logFC", feature_colname="Name", 
+                 padj_thr=0.001, label_sig_thr=1e-100, topn_genes=0, logfc_thr=0.1,
+                 fills=c(NA,NA,NA), colours=c("lightgrey", "#BB5566", "#004488"), extra_filename=paste0("limmatreat_logFC_thr",trt_log2fc_thr))
+NiceVolcanoPlots(probes.trt.bmigroup.df, comparison="CONTRAST", dir=de_dir, pval_colname="adj.P.Val", logfc_colname="logFC", feature_colname="Name", 
+                 padj_thr=0.05, label_sig_thr=1e-100, topn_genes=0, logfc_thr=0.1,
+                 fills=c(NA,NA,NA), colours=c("lightgrey", "#BB5566", "#004488"), extra_filename=paste0("limmatreat_logFC_threshold",trt_log2fc_thr))
+NiceVolcanoPlots(probes.trt.trigroup.df, comparison="CONTRAST", dir=de_dir, pval_colname="adj.P.Val", logfc_colname="logFC", feature_colname="Name", 
+                 padj_thr=0.05, label_sig_thr=1e-100, topn_genes=0, logfc_thr=0.1,
+                 fills=c(NA,NA,NA), colours=c("lightgrey", "#BB5566", "#004488"), extra_filename=paste0("limmatreat_logFC_threshold",trt_log2fc_thr))
+
+```
+
+### Relationship between top CpGs and stage
+
+```{r}
+
+TopFeaturesLinePlot <- function(sig_df, meta, beta_vals, n_cpgs=10, fileSuffix="", order_by="logFC", extra=xlab("Value"), out_dir="./") {
+  
+  # Dependencies
+  require(ggplot2)
+  
+  # Order by order column
+  sig_df <- sig_df[order(sig_df[,order_by], decreasing=TRUE),]
+  
+  # Get top/bottom n cpgs by logFC
+  top.pos_cpgs <- sig_df[1:n_cpgs,]
+  top.neg_cpgs <- sig_df[(nrow(sig_df)-(1:n_cpgs)),]
+  
+  # Split up/down-
+  top.pos_cpgs <- top.pos_cpgs[top.pos_cpgs[,order_by] > 0,]$Name
+  top.neg_cpgs <- top.neg_cpgs[top.neg_cpgs[,order_by] < 0,]$Name
+  
+  # Fix matrix
+  colnames(beta_vals) <- gsub("^X","",colnames(beta_vals))
+  
+  # Get metadata and methylation_data
+  meta$Sample_Name <- as.character(meta$Sample_Name)
+  top.combined_data.df <- cbind(meta, t(beta_vals[top.pos_cpgs,meta$Sample_Name]))
+  bot.combined_data.df <- cbind(meta, t(beta_vals[top.neg_cpgs,meta$Sample_Name]))
+  
+  # Add output
+  out_dir <- paste0(out_dir, "/topCpGs_by",order_by,"/")
+  dir.create(out_dir, recursive=TRUE)
+  
+  # Loop over cpgs
+  for (cpg in top.pos_cpgs) { 
+    
+    # Plot
+    plt <- ggplot(top.combined_data.df, aes(x=stage_weeks, y=.data[[cpg]])) + 
+      geom_point(shape=21, fill="darkred", alpha=0.65, size=5) + 
+      ggtitle(cpg) +
+      extra +
+      theme_bw(base_size=16) + theme(axis.title=element_text(size=24),
+                                     plot.title=element_text(size=30))
+      
+    # Save
+    ggsave(paste0(out_dir, cpg, ".orderedBy_top",order_by,fileSuffix,".linePlot.png"), units="px", width=4000, height=3000)
+    
+  }
+  
+  # Loop over cpgs
+  for (cpg in top.neg_cpgs) {
+    
+    # Plot
+    plt <- ggplot(bot.combined_data.df, aes(x=stage_weeks, y=.data[[cpg]])) + 
+      geom_point(shape=21, fill="darkblue", alpha=0.65, size=5) + 
+      ggtitle(cpg) +
+      extra + 
+      theme_bw(base_size=16) + theme(axis.title=element_text(size=24),
+                                     plot.title=element_text(size=30))
+      
+    # Save
+    ggsave(paste0(out_dir, cpg, ".orderedBy_bottom",order_by,fileSuffix,".linePlot.png"), units="px", width=4000, height=3000)
+    
+  }
+
+}  
+
+# Plot
+TopFeaturesLinePlot(sig_df=probes.trt.bmicont.df[probes.trt.bmicont.df$adj.P.Val < 0.001 & 
+                                                 !is.na(probes.trt.bmicont.df$adj.P.Val) & 
+                                                 probes.trt.bmicont.df$CONTRAST == "Z_STAGE_WEEKS",],
+                    meta=for_de.metadata, beta_vals=qnt.beta_mat, n_cpgs=25, fileSuffix=".methylation_beta_vs_stage",
+                    extra=labs(x="Stage (Weeks)", y="Beta"), out_dir=de_dir)
+
+```
+
+## DMR work
+
+### Dmrff
+
+Based on \* http://htmlpreview.github.io/?https://github.com/perishky/dmrff/blob/master/docs/tutorial.html \* http://htmlpreview.github.io/?https://github.com/perishky/dmrff/blob/master/docs/correlated-cpg-sites.html
+
+#### Correlations between CpGs
+
+Regions that fail Dmrff tend to comprise CpGs with strong dependencies on each-other, ie any one CpG explains a considerable proportion of the variance, or the association between the region and variable would tend to disappear when one or a few CpGs are included in the model. Therefore the region doesn't explain much more variance than any individual CpG. Conversely CpGs that do pass tend to explain different proportions of variance to the variable of interest.
+
+#### Test possible region definintion issue
+
+sapply(list.files(path=paste0(util_dir,"R/dmrff/R/"), pattern=".\[R,r\]"), function(rfile) source(paste0(util_dir,"R/dmrff/R/",rfile)))
+
+test_cpgs \<- 1:2500 \# c("cg25326086", "cg17158827", "cg24203169", "cg01247747", "cg01660796", "cg05760918", "cg10289269", "cg25630910", "cg20181887") fit \<- trt.bmicont.fit fit$p.value <- fit$p.value\[test_cpgs,\] fit$se <- fit$se\[test_cpgs,\] fit$s2.post <- fit$s2.post\[test_cpgs\] fit$stdev.unscaled <- fit$stdev.unscaled\[test_cpgs,\] fit$t <- fit$t\[test_cpgs,\] fit$coefficients <- fit$coefficients\[test_cpgs,\]
+
+x \<- DmrffTuneMaxGap(fit=fit, annotation=annotdata\[rownames(fit$coefficients),], m=qnt.m_mat[rownames(fit$coefficients),\], all_contrasts=c("Z_STAGE_WEEKS"), extra=paste0("Shrink"), dir=dmr_dir, max_gap_vals=c(1000)) y \<- DmrffTuneMaxGap(fit=fit, annotation=annotdata\[rownames(fit$coefficients),], m=qnt.m_mat[rownames(fit$coefficients),\], all_contrasts=c("Z_STAGE_WEEKS"), extra=paste0("NoShrink"), dir=dmr_dir, max_gap_vals=c(1000)) x y
+
+x y
+
+bhRF \<- bh.regionFinder(x=sign(sqrt(fit$s2.post) * fit$stdev.unscaled\[,"Z_STAGE_WEEKS"\]), chr=subAnnot$chr, pos=subAnnot$pos, maxGap=maxgap_val, cutoff=c(1,-1), verbose=TRUE) bhRF
+
+annotdata\[annotdata$pos >= bhRF$start & annotdata$pos <= bhRF$end & annotdata$chr == bhRF$chr,\]
+
+subAnnot \<- annotdata\[which(annotdata$Name %in% rownames(fit$coefficients)),\]
+
+y \<- probes.trt.bmicont.df\[probes.trt.bmicont.df$CONTRAST == "Z_STAGE_WEEKS" & probes.trt.bmicont.df$P.Value \< 0.05,\] y \<- y\[which(y$Name %in% subAnnot$Name),\]
+
+possible_cpgannots \<- probes.trt.bmicont.df\[probes.trt.bmicont.df$CONTRAST == "Z_STAGE_WEEKS" & probes.trt.bmicont.df$P.Value \< 0.05,\] x\["DMR_ID"\] \<- paste0("DMR\_",1:nrow(x)) x \<- AddDMRCpGDetails(x, probes.trt.bmicont.df\[probes.trt.bmicont.df$adj.P.Val < 0.001 & probes.trt.bmicont.df$CONTRAST == "Z_STAGE_WEEKS",\], possible_cpgannots) stageTall_df \<- GetTall_DMR_DF(x) stageTall_df \<- merge(stageTall_df, probes.trt.bmicont.df\[probes.trt.bmicont.df$CONTRAST == "Z_STAGE_WEEKS",c("Name","logFC","pos","P.Value","adj.P.Value")], by.x="CpG", by.y="Name") stageTall_df[sign(stageTall_df$estimate) != sign(stageTall_df\$logFC),\] x
+
+#### Run DMRFF
+ 
+```{r}
+
+# Define gap vals
+gapvals <- c(1000)
+
+# Loop over max gap values and run Dmrff on limma output
+annotdata <- annotdata[ annotdata$Name %in% rownames(qnt.m_mat),]
+
+# Split into up- and down-reg
+
+
+## Treat
+# trt.sex.dmrff_df        <- DmrffTuneMaxGap(fit=trt.bmicont.fit, annotation=annotdata, m=qnt.m_mat, all_contrasts=c("sexmale"),
+#                                             extra=paste0(".groupedby_sex.treat_log2FC",trt_log2fc_thr), sdir=dmr_dir, max_gap_vals=gapvals)
+#trt.bmigroup.dmrff_df   <- DmrffTuneMaxGap(fit=trt.bmigroup.fit, annotation=annotdata, m=qnt.m_mat, all_contrasts=colnames(bmigroup.contMatrix), 
+#                                            extra=paste0(".groupedby_bmi_by_group.treat_log2FC",trt_log2fc_thr), dir=dmr_dir, max_gap_vals=gapvals)
+trt.stgweek.dmrff_df    <- DmrffTuneMaxGap(fit=trt.bmicont.fit, annotation=annotdata, m=qnt.m_mat, all_contrasts=c("Z_STAGE_WEEKS"), reGenerateFile=TRUE,
+                                            extra=paste0(".groupedby_stage_as_continuous.treat_log2FC",trt_log2fc_thr), dir=dmr_dir, max_gap_vals=gapvals)
+#trt.sexstgweek.dmrff_df <- DmrffTuneMaxGap(fit=trt.bmicont.fit, annotation=annotdata, m=qnt.m_mat, all_contrasts=c("sexmale_Z_STAGE_WEEKS"),
+#                                            extra=paste0(".groupedby_sex_stage_as_continuous.treat_log2FC",trt_log2fc_thr), dir=dmr_dir, max_gap_vals=gapvals)
+#trt.bmicont.dmrff_df    <- DmrffTuneMaxGap(fit=trt.bmicont.fit, annotation=annotdata, m=qnt.m_mat, all_contrasts=c("Z_MAT_BMI"),
+#                                            extra=paste0(".groupedby_bmi_as_continuous.treat_log2FC",trt_log2fc_thr), dir=dmr_dir, max_gap_vals=gapvals)
+#trt.bmibinary.dmrff_df  <- DmrffTuneMaxGap(fit=trt.bmibinary.fit, annotation=annotdata, m=qnt.m_mat, all_contrasts=colnames(bmibinary.contMatrix), 
+#                                            extra=paste0(".groupedby_binarised_bmi.treat_log2FC",trt_log2fc_thr), dir=dmr_dir, max_gap_vals=gapvals)
+
+## Ebayes
+#eby.bmigroup.dmrff_df   <- DmrffTuneMaxGap(fit=eby.bmigroup.fit, annotation=annotdata, m=qnt.m_mat, all_contrasts=colnames(bmigroup.contMatrix), 
+#                                            extra=".groupedby_bmi_by_group", dir=dmr_dir, max_gap_vals=gapvals)
+#eby.bmicont.dmrff_df    <- DmrffTuneMaxGap(fit=eby.bmicont.fit, annotation=annotdata, m=qnt.m_mat, all_contrasts=c("Z_MAT_BMI"),
+#                                            extra=".groupedby_bmi_as_continuous", dir=dmr_dir, max_gap_vals=gapvals)
+# eby.stgweek.dmrff_df    <- DmrffTuneMaxGap(fit=eby.bmicont.fit, annotation=annotdata, m=qnt.m_mat, all_contrasts=c("Z_STAGE_WEEKS"),
+#                                             extra=".groupedby_stage_as_continuous", dir=dmr_dir, max_gap_vals=gapvals)
+eby.sex.dmrff_df        <- DmrffTuneMaxGap(fit=eby.bmicont.fit, annotation=annotdata, m=qnt.m_mat, all_contrasts=c("sexmale - sexfemale"), reGenerateFile=TRUE,
+                                            extra=".groupedby_sex", dir=dmr_dir, max_gap_vals=gapvals)
+#eby.sexstgweek.dmrff_df <- DmrffTuneMaxGap(fit=eby.bmicont.fit, annotation=annotdata, m=qnt.m_mat, all_contrasts=c("sexmale_Z_STAGE_WEEKS"),
+#                                            extra=".groupedby_sex_stage_as_continuous", dir=dmr_dir, max_gap_vals=gapvals)
+#eby.bmibinary.dmrff_df  <- DmrffTuneMaxGap(fit=eby.bmibinary.fit, annotation=annotdata, m=qnt.m_mat, all_contrasts=colnames(bmibinary.contMatrix), 
+#                                            extra=".groupedby_binarised_bmi", dir=dmr_dir, max_gap_vals=gapvals)
+
+
+```
+
+#### Fix zero p-value
+
+One DMR has a p-value lower than what my machine can handle so it defaults to 0. So we deal with it manually.
+
+```{r}
+
+pvalue.extreme <- function(z) {
+  
+   # Function adapted from:
+   # https://stackoverflow.com/questions/46416027/how-to-compute-p-values-from-z-scores-in-r-when-the-z-score-is-large-pvalue-muc/46416222#46416222
+  
+   log.pvalue <- log(2) + pnorm(abs(z), lower.tail = FALSE, log.p = TRUE)
+   log10.pvalue <- log.pvalue/log(10) ## from natural log to log10
+   
+   # Return
+   return(log10.pvalue)
+   
+}
+
+# Fix zero p-values (Just one for a redundant DMR)
+log10_pval <- pvalue.extreme(trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$p.adjust == 0,]$z)
+trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$p.adjust == 0,]["p.value"] <- 10^log10_pval
+trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$p.adjust == 0,]["p.adjust"] <- 10^log10_pval
+
+```
+
+#### Save
+
+```{r}
+
+# Save
+#write.table(trt.bmigroup.dmrff_df, paste0(dmr_dir,"dmrff_results.groupedby_bmi_by_group.treat_log2FC",trt_log2fc_thr,"unfiltered.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+#write.table(trt.bmicont.dmrff_df, paste0(dmr_dir,"dmrff_results.bmi_as_continuous.treat_log2FC",trt_log2fc_thr,"unfiltered.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(trt.stgweek.dmrff_df, paste0(dmr_dir,"dmrff_results.stage_as_continuous.treat_log2FC",trt_log2fc_thr,"unfiltered.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(eby.sex.dmrff_df, paste0(dmr_dir,"dmrff_results.sex.unfiltered.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+```
+
+#### Remove single CpGs
+
+```{r}
+
+# Drop single CpGs
+## eBayes
+#eby.bmigroup.dmrff_df <- eby.bmigroup.dmrff_df[eby.bmigroup.dmrff_df$n > 1,]
+#eby.bmicont.dmrff_df <- eby.bmicont.dmrff_df[eby.bmicont.dmrff_df$n > 1,]
+# eby.stgweek.dmrff_df <- eby.stgweek.dmrff_df[eby.stgweek.dmrff_df$n > 1,]
+eby.sex.dmrff_df <- eby.sex.dmrff_df[eby.sex.dmrff_df$n > 1,]
+#eby.sexstgweek.dmrff_df <- eby.sexstgweek.dmrff_df[eby.sexstgweek.dmrff_df$n > 1,]
+#eby.bmibinary.dmrff_df <- eby.bmicont.dmrff_df[eby.bmibinary.dmrff_df$n > 1,]
+
+## Treat
+#trt.bmigroup.dmrff_df <- trt.bmigroup.dmrff_df[trt.bmigroup.dmrff_df$n > 1,]
+#trt.bmicont.dmrff_df <- trt.bmicont.dmrff_df[trt.bmicont.dmrff_df$n > 1,]
+trt.stgweek.dmrff_df <- trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$n > 1,]
+# trt.sex.dmrff_df <- trt.sex.dmrff_df[trt.sex.dmrff_df$n > 1,]
+#trt.sexstgweek.dmrff_df <- trt.sexstgweek.dmrff_df[trt.sexstgweek.dmrff_df$n > 1,]
+#trt.bmibinary.dmrff_df <- trt.bmicont.dmrff_df[trt.bmibinary.dmrff_df$n > 1,]
+
+
+```
+
+#### Visualise distributions of gaps
+
+# Loop over gaps
+
+for (gap in unique(trt.stgweek.dmrff_df$MAXGAP)) { ggsave(paste0(dmr_dir, "stage.number_of_cpgs.per_dmr.maxgap",gap,".png"), units="px", width=2500, height=2000, ggplot(trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$MAXGAP == gap & trt.stgweek.dmrff_df$p.adjust < 0.001,], aes(x=n)) + geom_histogram(fill="darkorchid4", color="black", alpha=0.25) + ylim(0,12500) + xlim(0, 100) + geom_vline(xintercept=0, linetype="dashed",color="darkgrey") + geom_hline(yintercept=0, linetype="dashed",color="darkgrey") + labs(title=paste0("Max Gap = ",gap), x="Number of CpGs", y="Frequency") + theme_bw(base_size=16) + theme(axis.title=element_text(size=24))) } for (gap in unique(eby.sex.dmrff_df$MAXGAP)) { ggsave(paste0(dmr_dir, "sex.number_of_cpgs.per_dmr.maxgap",gap,".png"), units="px", width=2500, height=2000, ggplot(eby.sex.dmrff_df\[eby.sex.dmrff_df$MAXGAP == gap & eby.sex.dmrff_df$p.adjust \< 0.05,\], aes(x=n)) + geom_histogram(fill="darkorchid4", color="black", alpha=0.25) + ylim(0,50) + xlim(0, 20) + geom_vline(xintercept=0, linetype="dashed",color="darkgrey") + geom_hline(yintercept=0, linetype="dashed",color="darkgrey") + labs(title=paste0("Max Gap =",gap), x="Number of CpGs", y="Frequency") + theme_bw(base_size=16) + theme(axis.title=element_text(size=24))) }
+
+```{r}
+
+# Filter only DMRs equal to chosen max gap
+# trt.bmigroup.dmrff_df <- trt.bmigroup.dmrff_df[trt.bmigroup.dmrff_df$MAXGAP == maxgap_val,]
+# trt.bmicont.dmrff_df  <-   trt.bmicont.dmrff_df[trt.bmicont.dmrff_df$MAXGAP == maxgap_val,]
+trt.stgweek.dmrff_df  <-   trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$MAXGAP == maxgap_val,]
+eby.sex.dmrff_df      <-           eby.sex.dmrff_df[eby.sex.dmrff_df$MAXGAP == maxgap_val,]
+
+# Sig filter
+# trt.stgweek.dmrff_df <- trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$p.adjust < 0.001 & !is.na(trt.stgweek.dmrff_df$chr),]
+# trt.sex.dmrff_df <- trt.sex.dmrff_df[trt.sex.dmrff_df$p.adjust < 0.05 & !is.na(trt.sex.dmrff_df$chr),]
+
+```
+
+#### Add DMR IDs and CpGs
+
+```{r}
+# Add DMR annotations
+gc()
+possible_cpgs <- unique(probes.trt.bmicont.df[probes.trt.bmicont.df$CONTRAST == "Z_STAGE_WEEKS",]$Name)
+possible_cpgannots <- annotdata[which(annotdata$Name %in% possible_cpgs),]
+trt.stgweek.dmrff_df <- AddDMRCpGDetails(trt.stgweek.dmrff_df, 
+                                         probes.trt.bmicont.df[probes.trt.bmicont.df$adj.P.Val < 0.001 & 
+                                                               probes.trt.bmicont.df$CONTRAST == "Z_STAGE_WEEKS",], 
+                                         possible_cpgannots)
+possible_cpgs <- unique(probes.eby.bmicont.df[probes.eby.bmicont.df$CONTRAST == "sexmale - sexfemale",]$Name)
+possible_cpgannots <- annotdata[which(annotdata$Name %in% possible_cpgs),]
+eby.sex.dmrff_df     <- AddDMRCpGDetails(eby.sex.dmrff_df, 
+                                         probes.eby.bmicont.df[probes.eby.bmicont.df$adj.P.Val < 0.01 & 
+                                                               probes.eby.bmicont.df$CONTRAST == "sexmale - sexfemale",], 
+                                         possible_cpgannots)
+
+# Filter DMRs with NO CpGs. These are DMRs with only non-significant DMRs present
+# Also drop single CpG DMRs
+trt.stgweek.dmrff_df <- trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$CpG != "" & trt.stgweek.dmrff_df$n > 1,]
+eby.sex.dmrff_df <- eby.sex.dmrff_df[eby.sex.dmrff_df$CpG != "" & eby.sex.dmrff_df$n > 1,]
+
+```
+
+### Make tall format
+
+```{r}
+
+# Update DMR ID
+trt.stgweek.dmrff_df["DMR_ID"] <- paste0("dDMR_",1:nrow(trt.stgweek.dmrff_df))
+eby.sex.dmrff_df["DMR_ID"] <- paste0("sDMR_",1:nrow(eby.sex.dmrff_df))
+rownames(trt.stgweek.dmrff_df) <- trt.stgweek.dmrff_df$DMR_ID
+rownames(eby.sex.dmrff_df) <- eby.sex.dmrff_df$DMR_ID
+
+# Get tall stage and sex dataframes
+stageTall_df <- GetTall_DMR_DF(trt.stgweek.dmrff_df)
+sexTall_df   <- GetTall_DMR_DF(eby.sex.dmrff_df)
+
+# Confirm no CpGs with nominal p < 0.05
+# This is fine as we allow this. The DMR region changing procedure entails the
+# inclusion of these.
+if (!nrow(stageTall_df) == nrow(stageTall_df[stageTall_df$p.value < 0.05,])) { print("Not all DMR CpGs have nomial p < 0.05") }
+if (!nrow(sexTall_df) == nrow(sexTall_df[sexTall_df$p.value < 0.05,])) { print("Not all DMR CpGs have nomial p < 0.05") }
+
+```
+
+### Check direction of CpGs
+
+Note we accept CpGs with opposite effect sizes in DMRs as these have nominal p \< 0.05.
+
+```{r}
+
+# Add CpG log2FC
+stageTall_df <- merge(stageTall_df, probes.trt.bmicont.df[probes.trt.bmicont.df$CONTRAST == "Z_STAGE_WEEKS",c("Name","logFC","pos","P.Value","adj.P.Val")], by.x="CpG", by.y="Name")
+sexTall_df <- merge(sexTall_df, probes.eby.bmicont.df[probes.eby.bmicont.df$CONTRAST == "sexmale - sexfemale",c("Name","logFC","pos","P.Value","adj.P.Val")], by.x="CpG", by.y="Name")
+stageTall_df <- stageTall_df[order(paste0(as.numeric(gsub("chr","",stageTall_df$chr)),stageTall_df$pos), decreasing=FALSE),]
+sexTall_df <- sexTall_df[order(paste0(as.numeric(gsub("chr","",sexTall_df$chr)),sexTall_df$pos), decreasing=FALSE),]
+
+# Check inconsistent signs vs DMR estimates
+stage_checkEst <- stageTall_df[sign(stageTall_df$estimate) != sign(stageTall_df$logFC),]; table(stage_checkEst$DMR_ID)
+sex_checkEst <- sexTall_df[sign(sexTall_df$estimate) != sign(sexTall_df$logFC),]; table(sex_checkEst$DMR_ID)
+
+# Check inconsistent signs vs DMR estimates (significant DMRs)
+stage_checkEst <- stageTall_df[sign(stageTall_df$estimate) != sign(stageTall_df$logFC) & stageTall_df$p.adjust < 0.001,]; table(stage_checkEst$DMR_ID)
+sex_checkEst <- sexTall_df[sign(sexTall_df$estimate) != sign(sexTall_df$logFC) & stageTall_df$p.adjust < 0.01,]; table(sex_checkEst$DMR_ID)
+
+```
+
+### Plot
+
+```{r}
+
+# Get sig
+sig_trt.stgweek.dmrff_df <- trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$p.adjust < 0.001,]
+sig_eby.sex.dmrff_df <- eby.sex.dmrff_df[eby.sex.dmrff_df$p.adjust < 0.01,]
+
+# Order by n
+sig_trt.stgweek.dmrff_df <- sig_trt.stgweek.dmrff_df[order(sig_trt.stgweek.dmrff_df$n, decreasing=TRUE),]
+sig_eby.sex.dmrff_df <- sig_eby.sex.dmrff_df[order(sig_eby.sex.dmrff_df$n, decreasing=TRUE),]
+rownames(sig_trt.stgweek.dmrff_df) <- sig_trt.stgweek.dmrff_df$DMR_ID
+rownames(sig_eby.sex.dmrff_df) <- sig_eby.sex.dmrff_df$DMR_ID
+
+# Label genes in top 25 n
+trt.stgweek.dmrff_df["LABEL"] <- "ns"; trt.stgweek.dmrff_df[sig_trt.stgweek.dmrff_df$DMR_ID[1:15],]["LABEL"] <- "Top 15\nby N CpG"
+eby.sex.dmrff_df["LABEL"] <- "ns"; eby.sex.dmrff_df[sig_eby.sex.dmrff_df$DMR_ID[1:15],]["LABEL"] <- "Top 15\nby N CpG"
+
+# Plot
+stg_plt <- ggplot(trt.stgweek.dmrff_df, aes(x=n, y=estimate, label=SYMBOL, fill=LABEL, color=LABEL)) + 
+  geom_hline(yintercept=0, linetype="dashed", color="darkgrey") +
+  geom_vline(xintercept=0, linetype="dashed", color="darkgrey") +
+  geom_point(data=trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$LABEL == "ns",], 
+             mapping=aes(size=-log10(p.adjust)), shape=21, alpha=0.65) +
+  geom_point(data=trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$LABEL != "ns",], 
+             mapping=aes(size=-log10(p.adjust)), shape=21, alpha=0.65) +
+  scale_fill_manual(values=c("darkgrey", "red")) + scale_color_manual(values=c("darkgrey", "darkred")) + 
+  geom_text_repel(data=trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$LABEL != "ns",], 
+                  color="darkred",size=3.5, force_pull=0.5) +
+  ylim(-1.15, 1.15) +
+  xlab("Number of CpGs") + ylab("Estimate") + ggtitle("Gestation Stage DMRs") +
+  theme_bw(base_size=12) + theme(axis.title=element_text(size=16), plot.title=element_text(size=20)) +
+  guides(fill=guide_legend(title=""), color=guide_legend(title=""))
+sex_plt <- ggplot(eby.sex.dmrff_df, aes(x=n, y=estimate, label=SYMBOL, fill=LABEL, color=LABEL)) + 
+  geom_hline(yintercept=0, linetype="dashed", color="darkgrey") +
+  geom_vline(xintercept=0, linetype="dashed", color="darkgrey") +
+  geom_point(data=eby.sex.dmrff_df[eby.sex.dmrff_df$LABEL == "ns",], 
+             mapping=aes(size=-log10(p.adjust)), shape=21, alpha=0.65) +
+  geom_point(data=eby.sex.dmrff_df[eby.sex.dmrff_df$LABEL != "ns",], 
+             mapping=aes(size=-log10(p.adjust)), shape=21, alpha=0.65) +
+  scale_fill_manual(values=c("darkgrey", "red")) + scale_color_manual(values=c("darkgrey", "darkred")) + 
+  geom_text_repel(data=eby.sex.dmrff_df[eby.sex.dmrff_df$LABEL != "ns",], 
+                  color="darkred",size=3.5, force_pull=2) +
+  ylim(-2, 2) +
+  xlab("Number of CpGs") + ylab("Estimate") + ggtitle("Sex DMRs") +
+  theme_bw(base_size=12) + theme(axis.title=element_text(size=16), plot.title=element_text(size=20)) +
+  guides(fill=guide_legend(title=""), color=guide_legend(title=""))
+
+# Save
+ggsave(paste0(dmr_dir, "dmrStage_nCpGVsEstimate.topLabelled.top15nCpG.pdf"), stg_plt, units="px", width=3000, height=2250, device="pdf", dpi=300)
+ggsave(paste0(dmr_dir, "dmrSex_nCpGVsEstimate.topLabelled.top15nCpG.pdf"), sex_plt, units="px", width=3000, height=2250, device="pdf", dpi=300)
+
+# Plot
+trt.stgweek.dmrff_df$LABEL <- factor(trt.stgweek.dmrff_df$LABEL, levels=c("Top 15\nby N CpG","ns"))
+eby.sex.dmrff_df$LABEL <- factor(eby.sex.dmrff_df$LABEL, levels=c("Top 15\nby N CpG","ns"))
+stg_plt <- ggplot(trt.stgweek.dmrff_df, aes(label=SYMBOL, 
+                                            fill=LABEL, 
+                                            color=LABEL)) + 
+  geom_hline(yintercept=0, linetype="dashed", color="darkgrey") +
+  geom_vline(xintercept=0, linetype="dashed", color="darkgrey") +
+  geom_point(data=trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$LABEL == "ns",], 
+             mapping=aes(y=-log10(p.adjust), x=estimate, size=n), shape=21, alpha=0.65) +
+  geom_point(data=trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$LABEL != "ns",], 
+             mapping=aes(y=-log10(p.adjust), x=estimate, size=n), shape=21, alpha=0.65) +
+  scale_fill_manual(values=c("Top 15\nby N CpG"="red", "ns"="darkgrey")) + 
+  scale_color_manual(values=c("Top 15\nby N CpG"="darkred", "ns"="darkgrey")) +
+  geom_text_repel(data=trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$LABEL != "ns",], 
+                  mapping=aes(y=-log10(p.adjust), x=estimate),
+                  color="darkred",size=3.5, force_pull=0.5) +
+  ylim(0, 325) +
+  xlab("Estimate") + ylab("-Log10 Adjusted P-Value") + ggtitle("Gestation Stage DMRs") +
+  theme_bw(base_size=12) + theme(axis.title=element_text(size=16), plot.title=element_text(size=20)) +
+  guides(fill=guide_legend(title=""), color=guide_legend(title=""), size=guide_legend(title="N CpGs"))
+sex_plt <- ggplot(eby.sex.dmrff_df, aes(label=SYMBOL, 
+                                            fill=factor(LABEL, levels=c("Top 15\nby N CpG","ns")), 
+                                            color=factor(LABEL, levels=c("Top 15\nby N CpG","ns")))) + 
+  geom_hline(yintercept=0, linetype="dashed", color="darkgrey") +
+  geom_vline(xintercept=0, linetype="dashed", color="darkgrey") +
+  geom_point(data=eby.sex.dmrff_df[eby.sex.dmrff_df$LABEL == "ns",], 
+             mapping=aes(y=-log10(p.adjust), x=estimate, size=n), shape=21, alpha=0.65) +
+  geom_point(data=eby.sex.dmrff_df[eby.sex.dmrff_df$LABEL != "ns",], 
+             mapping=aes(y=-log10(p.adjust), x=estimate, size=n), shape=21, alpha=0.65) +
+  scale_fill_manual(values=c("Top 15\nby N CpG"="red", "ns"="darkgrey")) + 
+  scale_color_manual(values=c("Top 15\nby N CpG"="darkred", "ns"="darkgrey")) +
+  geom_text_repel(data=eby.sex.dmrff_df[eby.sex.dmrff_df$LABEL != "ns",], 
+                  mapping=aes(y=-log10(p.adjust), x=estimate),
+                  color="darkred",size=1.5, force=25) +
+  xlab("Estimate") + ylab("-Log10 Adjusted P-Value") + ggtitle("Sex DMRs") +
+  theme_bw(base_size=12) + theme(axis.title=element_text(size=16), plot.title=element_text(size=20)) +
+  guides(fill=guide_legend(title=""), color=guide_legend(title=""), size=guide_legend(title="N CpGs"))
+
+# Save
+ggsave(paste0(dmr_dir, "dmrStage_EstimateVspadj.topLabelled.top15nCpG.pdf"), stg_plt, units="px", width=2250, height=2250, device="pdf", dpi=300)
+ggsave(paste0(dmr_dir, "dmrSex_EstimateVspadj.topLabelled.top15nCpG.pdf"), sex_plt, units="px", width=2250, height=2250, device="pdf", dpi=300)
+
+```
+
+```{r}
+
+# Get sig
+sig_trt.stgweek.dmrff_df <- trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$p.adjust < 0.001,]
+sig_eby.sex.dmrff_df <- eby.sex.dmrff_df[eby.sex.dmrff_df$p.adjust < 0.01,]
+
+# Order by n
+sig_trt.stgweek.dmrff_df <- sig_trt.stgweek.dmrff_df[order(sig_trt.stgweek.dmrff_df$p.adjust, decreasing=FALSE),]
+sig_eby.sex.dmrff_df <- sig_eby.sex.dmrff_df[order(sig_eby.sex.dmrff_df$p.adjust, decreasing=FALSE),]
+rownames(sig_trt.stgweek.dmrff_df) <- sig_trt.stgweek.dmrff_df$DMR_ID
+rownames(sig_eby.sex.dmrff_df) <- sig_eby.sex.dmrff_df$DMR_ID
+
+# Label genes in top 25 n
+trt.stgweek.dmrff_df["LABEL"] <- "ns"; trt.stgweek.dmrff_df[sig_trt.stgweek.dmrff_df$DMR_ID[1:15],]["LABEL"] <- "Top 15 by\np.adjust<0.001"
+eby.sex.dmrff_df["LABEL"] <- "ns"; eby.sex.dmrff_df[sig_eby.sex.dmrff_df$DMR_ID[1:15],]["LABEL"] <- "Top 15 by\np.adjust<0.01"
+
+# Plot
+stg_plt <- ggplot(trt.stgweek.dmrff_df, aes(label=SYMBOL, 
+                                            fill=LABEL, 
+                                            color=LABEL)) + 
+  geom_point(data=trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$LABEL == "ns",], 
+             mapping=aes(x=n, y=estimate, size=n), shape=21, alpha=0.65) +
+  geom_point(data=trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$LABEL != "ns",], 
+             mapping=aes(x=n, y=estimate, size=n), shape=21, alpha=0.65) +
+  scale_fill_manual(values=c("darkgrey", "red")) + scale_color_manual(values=c("darkgrey", "darkred")) + 
+  geom_text_repel(data=trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$LABEL != "ns",], 
+                  mapping=aes(x=n, y=estimate),
+                  color="darkred",size=3.5, force_pull=0.5) +
+  geom_hline(yintercept=0, linetype="dashed", color="darkgrey") +
+  geom_vline(xintercept=0, linetype="dashed", color="darkgrey") +
+  ylim(-1.15, 1.15) +
+  xlab("Number of CpGs") + ylab("Estimate") + ggtitle("Gestation Stage DMRs") +
+  theme_bw(base_size=12) + theme(axis.title=element_text(size=16), plot.title=element_text(size=20)) +
+  guides(fill=guide_legend(title=""), color=guide_legend(title=""))
+sex_plt <- ggplot(eby.sex.dmrff_df, aes(label=SYMBOL, 
+                                            fill=LABEL, 
+                                            color=LABEL)) + 
+  geom_point(data=eby.sex.dmrff_df[eby.sex.dmrff_df$LABEL == "ns",], 
+             mapping=aes(x=n, y=estimate, size=n), shape=21, alpha=0.65) +
+  geom_point(data=eby.sex.dmrff_df[eby.sex.dmrff_df$LABEL != "ns",], 
+             mapping=aes(x=n, y=estimate, size=n), shape=21, alpha=0.65) +
+  scale_fill_manual(values=c("darkgrey", "red")) + scale_color_manual(values=c("darkgrey", "darkred")) + 
+  geom_text_repel(data=eby.sex.dmrff_df[eby.sex.dmrff_df$LABEL != "ns",], 
+                  mapping=aes(x=n, y=estimate),
+                  color="darkred",size=2, force=10) +
+  geom_hline(yintercept=0, linetype="dashed", color="darkgrey") +
+  geom_vline(xintercept=0, linetype="dashed", color="darkgrey") +
+  ylim(-2, 2) +
+  xlab("Number of CpGs") + ylab("Estimate") + ggtitle("Sex DMRs") +
+  theme_bw(base_size=12) + theme(axis.title=element_text(size=16), plot.title=element_text(size=20)) +
+  guides(fill=guide_legend(title=""), color=guide_legend(title=""))
+
+# Save
+ggsave(paste0(dmr_dir, "dmrStage_nCpGVsEstimate.topLabelled.top15nSigPadj.pdf"), stg_plt, units="px", width=3000, height=2250, device="pdf", dpi=300)
+ggsave(paste0(dmr_dir, "dmrSex_nCpGVsEstimate.topLabelled.top15nSigPadj.pdf"), sex_plt, units="px", width=3000, height=2250, device="pdf", dpi=300)
+
+# Plot
+trt.stgweek.dmrff_df$LABEL <- factor(trt.stgweek.dmrff_df$LABEL, levels=c("Top 15 by\np.adjust<0.001","ns"))
+eby.sex.dmrff_df$LABEL <- factor(eby.sex.dmrff_df$LABEL, levels=c("Top 15 by\np.adjust<0.01","ns"))
+stg_plt <- ggplot(trt.stgweek.dmrff_df, aes(label=SYMBOL, 
+                                            fill=LABEL, 
+                                            color=LABEL)) + 
+  geom_point(data=trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$LABEL == "ns",], 
+             mapping=aes(y=-log10(p.adjust), x=estimate, size=n), shape=21, alpha=0.65) +
+  geom_point(data=trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$LABEL != "ns",], 
+             mapping=aes(y=-log10(p.adjust), x=estimate, size=n), shape=21, alpha=0.65) +
+  scale_fill_manual(values=c("Top 15 by\np.adjust<0.001"="red", "ns"="darkgrey")) + 
+  scale_color_manual(values=c("Top 15 by\np.adjust<0.001"="darkred", "ns"="darkgrey")) +
+  geom_text_repel(data=trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$LABEL != "ns",], 
+                  mapping=aes(y=-log10(p.adjust), x=estimate),
+                  color="darkred",size=3.5, force_pull=0.5) +
+  geom_hline(yintercept=0, linetype="dashed", color="darkgrey") +
+  geom_vline(xintercept=0, linetype="dashed", color="darkgrey") +
+  ylim(0, 325) +
+  xlab("Estimate") + ylab("-Log10 Adjusted P-Value") + ggtitle("Gestation Stage DMRs") +
+  theme_bw(base_size=12) + theme(axis.title=element_text(size=16), plot.title=element_text(size=20)) +
+  guides(fill=guide_legend(title=""), color=guide_legend(title=""), size=guide_legend(title="N CpGs"))
+sex_plt <- ggplot(eby.sex.dmrff_df, aes(label=SYMBOL, 
+                                            fill=factor(LABEL, levels=c("Top 15 by\np.adjust<0.01","ns")), 
+                                            color=factor(LABEL, levels=c("Top 15 by\np.adjust<0.01","ns")))) + 
+  geom_point(data=eby.sex.dmrff_df[eby.sex.dmrff_df$LABEL == "ns",], 
+             mapping=aes(y=-log10(p.adjust), x=estimate, size=n), shape=21, alpha=0.65) +
+  geom_point(data=eby.sex.dmrff_df[eby.sex.dmrff_df$LABEL != "ns",], 
+             mapping=aes(y=-log10(p.adjust), x=estimate, size=n), shape=21, alpha=0.65) +
+  scale_fill_manual(values=c("Top 15 by\np.adjust<0.01"="red", "ns"="darkgrey")) + 
+  scale_color_manual(values=c("Top 15 by\np.adjust<0.01"="darkred", "ns"="darkgrey")) +
+  geom_text_repel(data=eby.sex.dmrff_df[eby.sex.dmrff_df$LABEL != "ns",], 
+                  mapping=aes(y=-log10(p.adjust), x=estimate),
+                  color="darkred",size=1.5, force=45) +
+  geom_hline(yintercept=0, linetype="dashed", color="darkgrey") +
+  geom_vline(xintercept=0, linetype="dashed", color="darkgrey") +
+  xlab("Estimate") + ylab("-Log10 Adjusted P-Value") + ggtitle("Sex DMRs") +
+  theme_bw(base_size=12) + theme(axis.title=element_text(size=16), plot.title=element_text(size=20)) +
+  guides(fill=guide_legend(title=""), color=guide_legend(title=""), size=guide_legend(title="N CpGs"))
+
+# Save
+ggsave(paste0(dmr_dir, "dmrStage_EstimateVspadj.topLabelled.top15nSigPadj.pdf"), stg_plt, units="px", width=2250, height=2250, device="pdf", dpi=300)
+ggsave(paste0(dmr_dir, "dmrSex_EstimateVspadj.topLabelled.top15nSigPadj.pdf"), sex_plt, units="px", width=2250, height=2250, device="pdf", dpi=300)
+
+```
+
+### Save DMRs
+
+```{r}
+
+# Save
+write.table(trt.stgweek.dmrff_df[,
+            c("DMR_ID","SITE","chr","start","end","SYMBOL","DISTANCE","B","S","estimate","se","z","p.value","p.adjust","CONTRAST","MAXGAP","CpG","n","nSigCpg","nNonSigCpg","pSigCpg")], 
+            file=paste0(dmr_dir, "dmrff_results.stage_as_continuous.treat_log2FC",trt_log2fc_thr,".tsv"),
+            col.names = TRUE,row.names = FALSE, sep = "\t", quote = FALSE)
+# Save
+write.table(eby.sex.dmrff_df[,
+            c("DMR_ID","SITE","chr","start","end","SYMBOL","DISTANCE","B","S","estimate","se","z","p.value","p.adjust","CONTRAST","MAXGAP","CpG","n","nSigCpg","nNonSigCpg","pSigCpg")], 
+            file=paste0(dmr_dir, "dmrff_results.sex.tsv"),
+            col.names = TRUE,row.names = FALSE, sep = "\t", quote = FALSE)
+
+# Save
+write.table(trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$estimate > 0,
+            c("DMR_ID","SITE","chr","start","end","SYMBOL","DISTANCE","B","S","estimate","se","z","p.value","p.adjust","CONTRAST","MAXGAP","CpG","n","nSigCpg","nNonSigCpg","pSigCpg")], 
+            file=paste0(dmr_dir, "dmrff_results.stage_as_continuous.treat_log2FC",trt_log2fc_thr,".up.tsv"),
+            col.names = TRUE,row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(trt.stgweek.dmrff_df[trt.stgweek.dmrff_df$estimate < 0, 
+            c("DMR_ID","SITE","chr","start","end","SYMBOL","DISTANCE","B","S","estimate","se","z","p.value","p.adjust","CONTRAST","MAXGAP","CpG","n","nSigCpg","nNonSigCpg","pSigCpg")], 
+            file=paste0(dmr_dir, "dmrff_results.stage_as_continuous.treat_log2FC",trt_log2fc_thr,".down.tsv"),
+            col.names = TRUE,row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(eby.sex.dmrff_df[eby.sex.dmrff_df$estimate > 0,
+            c("DMR_ID","SITE","chr","start","end","SYMBOL","DISTANCE","B","S","estimate","se","z","p.value","p.adjust","CONTRAST","MAXGAP","CpG","n","nSigCpg","nNonSigCpg","pSigCpg")], 
+            file=paste0(dmr_dir, "dmrff_results.sex.up.tsv"),
+            col.names = TRUE,row.names = FALSE, sep = "\t", quote = FALSE)
+write.table(eby.sex.dmrff_df[eby.sex.dmrff_df$estimate < 0,
+            c("DMR_ID","SITE","chr","start","end","SYMBOL","DISTANCE","B","S","estimate","se","z","p.value","p.adjust","CONTRAST","MAXGAP","CpG","n","nSigCpg","nNonSigCpg","pSigCpg")], 
+            file=paste0(dmr_dir, "dmrff_results.sex.down.tsv"),
+            col.names = TRUE,row.names = FALSE, sep = "\t", quote = FALSE)
+
+# Save
+write.table(stageTall_df[,
+            c("DMR_ID","SITE","chr","start","end","SYMBOL","DISTANCE","B","S","estimate","se","z","p.value","p.adjust","CONTRAST","MAXGAP","CpG","pos","logFC","P.Value","adj.P.Val","n","nSigCpg","nNonSigCpg","pSigCpg")], 
+            file=paste0(dmr_dir, "dmrff_results.stage_as_continuous.treat_log2FC",trt_log2fc_thr,".preClust_TallFormat.tsv"),
+            col.names = TRUE,row.names = FALSE, sep = "\t", quote = FALSE)
+# Save
+write.table(sexTall_df[,
+            c("DMR_ID","SITE","chr","start","end","SYMBOL","DISTANCE","B","S","estimate","se","z","p.value","p.adjust","CONTRAST","MAXGAP","CpG","pos","logFC","P.Value","adj.P.Val","n","nSigCpg","nNonSigCpg","pSigCpg")], 
+            file=paste0(dmr_dir, "dmrff_results.sex.preClust_TallFormat.tsv"),
+            col.names = TRUE,row.names = FALSE, sep = "\t", quote = FALSE)
+
+```
+
+### Add mean DMR M-values
+
+```{r}
+
+# Add DMR IDs to M value matrix
+mMat_byStageDMR <- merge(stageTall_df[,c("CpG","DMR_ID")], qnt.m_mat, by.x="CpG", by.y="row.names")
+mMat_bySexDMR <- merge(sexTall_df[,c("CpG","DMR_ID")], qnt.m_mat, by.x="CpG", by.y="row.names")
+
+# Aggregate to mean
+mMatMean_byStageDMR <- aggregate(. ~ DMR_ID, data=mMat_byStageDMR[,-1], FUN=mean)
+mMatMean_bySexDMR <- aggregate(. ~ DMR_ID, data=mMat_bySexDMR[,-1], FUN=mean)
+
+# Save
+write.table(mMat_byStageDMR, paste0(dmr_dir,"dmrff_dmrs.stage_as_continuous.mean_cpg_mval.maxGap",maxgap_val,"_withIDs.tsv"), quote=FALSE, sep="\t")
+write.table(mMatMean_bySexDMR, paste0(dmr_dir,"dmrff_dmrs.sex.mean_cpg_mval.maxGap",maxgap_val,"_withIDs.tsv"), quote=FALSE, sep="\t")
+
+```
+
+### Get DMR CpG methylation
+
+```{r}
+
+# Save
+write.table(cbind(CpG=stageTall_df$CpG, 
+                  SigCpG=ifelse(stageTall_df$P.Value < 0.05, "(nominal) p<0.05", "ns"), 
+                  SigDMR=ifelse(stageTall_df$p.adjust < 0.001, "(DMR) p.adjust<0.001", "ns"), 
+                  data.frame(qnt.m_mat[stageTall_df$CpG,])), 
+            paste0(dmr_dir, "dmrff_results.stage_as_continuous.treat_log2FC",trt_log2fc_thr,".cpgMvals.tsv"),
+            sep="\t", quote=FALSE, col.names=TRUE, row.names=FALSE)
+write.table(cbind(CpG=sexTall_df$CpG, 
+                  SigCpG=ifelse(sexTall_df$P.Value < 0.05, "(nominal) p<0.05", "ns"), 
+                  SigDMR=ifelse(sexTall_df$p.adjust < 0.001, "(DMR) p.adjust<0.001", "ns"), 
+                  data.frame(qnt.m_mat[sexTall_df$CpG,])), 
+            paste0(dmr_dir, "dmrff_results.sex.cpgMvals.tsv"),
+            sep="\t", quote=FALSE, col.names=TRUE, row.names=FALSE)
+
+```
+
+### Gene ontology
+
+For region, background is all CpGs in DMRs.
+
+#### CpG
+
+```{r}
+
+sig_cpgs <- c("Z_STAGE_WEEKS"=0.001, "sexmale - sexfemale"=0.05)
+
+# Split by up- and down-regulation
+for (direction in c("all","up","down")) {
+  
+  # Get up/down-reg
+  if (direction == "up") { 
+    
+    ebyProbes <- probes.eby.bmicont.df[probes.eby.bmicont.df$logFC > 0,] 
+    trtProbes <- probes.trt.bmicont.df[probes.trt.bmicont.df$logFC > 0,] 
+    
+    # CpG-level
+    print(paste0("RUNNING FOR :- ",direction))
+    up_goMethCpG_eby <- RunMethylEnrichment(ebyProbes, sig_cpgs=sig_cpgs, array.type="EPIC", cpg_df=probes.eby.bmicont.df[,c("Name","CONTRAST")],
+                                               groupIsBackGroundSubset=TRUE, groupCol="CONTRAST",
+                                            pval_col="adj.P.Val", dir=gocpg_dir, CpGCol="Name", extra=paste0(".",direction,"DiffCpGs"))
+    up_goMethCpG_trt <- RunMethylEnrichment(trtProbes, sig_cpgs=sig_cpgs, array.type="EPIC", cpg_df=probes.trt.bmicont.df[,c("Name","CONTRAST")],
+                                               groupIsBackGroundSubset=TRUE, groupCol="CONTRAST",
+                                            pval_col="adj.P.Val", dir=gocpg_dir, CpGCol="Name", extra=paste0(".",direction,"DiffCpGs_treatLog2FC0.1"))
+     
+  # ELse if down
+  } else if (direction == "down") { 
+    
+    ebyProbes <- probes.eby.bmicont.df[probes.eby.bmicont.df$logFC < 0,] 
+    trtProbes <- probes.trt.bmicont.df[probes.trt.bmicont.df$logFC < 0,] 
+    
+    # CpG-level
+    print(paste0("RUNNING FOR :- ",direction))
+    down_goMethCpG_eby <- RunMethylEnrichment(ebyProbes, sig_cpgs=sig_cpgs, array.type="EPIC", cpg_df=probes.eby.bmicont.df[,c("Name","CONTRAST")],
+                                               groupIsBackGroundSubset=TRUE, groupCol="CONTRAST",
+                                              pval_col="adj.P.Val", dir=gocpg_dir, CpGCol="Name", extra=paste0(".",direction,"DiffCpGs"))
+    down_goMethCpG_trt <- RunMethylEnrichment(trtProbes, sig_cpgs=sig_cpgs, array.type="EPIC", cpg_df=probes.trt.bmicont.df[,c("Name","CONTRAST")],
+                                               groupIsBackGroundSubset=TRUE, groupCol="CONTRAST",
+                                              pval_col="adj.P.Val", dir=gocpg_dir, CpGCol="Name", extra=paste0(".",direction,"DiffCpGs_treatLog2FC0.1"))
+    
+  # Else if all comparisons
+  } else if (direction == "all") {
+    
+    ebyProbes <- probes.eby.bmicont.df
+    trtProbes <- probes.trt.bmicont.df
+
+    # CpG-level
+    print(paste0("RUNNING FOR :- ",direction))
+    all_goMethCpG_eby <- RunMethylEnrichment(ebyProbes, sig_cpgs=sig_cpgs, array.type="EPIC", cpg_df=probes.eby.bmicont.df[,c("Name","CONTRAST")],
+                                               groupIsBackGroundSubset=TRUE, groupCol="CONTRAST",
+                                             pval_col="adj.P.Val", dir=gocpg_dir, CpGCol="Name", extra=paste0(".",direction,"DiffCpGs"))
+    all_goMethCpG_trt <- RunMethylEnrichment(trtProbes, sig_cpgs=sig_cpgs, array.type="EPIC", cpg_df=probes.trt.bmicont.df[,c("Name","CONTRAST")],
+                                               groupIsBackGroundSubset=TRUE, groupCol="CONTRAST",
+                                             pval_col="adj.P.Val", dir=gocpg_dir, CpGCol="Name", extra=paste0(".",direction,"DiffCpGs_treatLog2FC0.1"))
+    
+  }
+  
+}
+
+```
+
+#### DMR
+
+```{r}
+
+# Split by up- and down-regulation
+for (direction in c("all","up","down")) {
+  
+  # Get up/down-reg
+  if (direction == "up") { 
+    
+    stageDMR <- stageTall_df[stageTall_df$logFC > 0,] 
+    sexDMR <- sexTall_df[sexTall_df$logFC > 0,] 
+    
+    # CpG-level
+    print(paste0("RUNNING FOR :- ",direction))
+    up_goRegionDMRStage <- RunMethylEnrichment(stageDMR[stageDMR$p.adjust < 0.001,], cpg_df=probes.trt.bmicont.df[,c("Name","CONTRAST")], 
+                                               groupIsBackGroundSubset=TRUE, groupCol="CONTRAST",
+                                               sig_cpgs=c("Z_STAGE_WEEKS"=1), cpg_level=FALSE, array.type="EPIC",
+                                               pval_col="adj.P.Val", dir=godmr_dir, CpGCol="Name", extra=paste0(".",direction,"DMRStage"))
+    up_goRegionDMRSex   <- RunMethylEnrichment(sexDMR[sexDMR$p.adjust < 0.01,], cpg_df=probes.trt.bmicont.df[,c("Name","CONTRAST")], 
+                                               groupIsBackGroundSubset=TRUE, groupCol="CONTRAST",
+                                               sig_cpgs=c("sexmale - sexfemale"=1), cpg_level=FALSE, array.type="EPIC",
+                                               pval_col="adj.P.Val", dir=godmr_dir, CpGCol="Name", extra=paste0(".",direction,"DMRSex"))
+     
+  # ELse if down
+  } else if (direction == "down") { 
+    
+    stageDMR <- stageTall_df[stageTall_df$logFC < 0,] 
+    sexDMR <- sexTall_df[sexTall_df$logFC < 0,] 
+    
+    # CpG-level
+    print(paste0("RUNNING FOR :- ",direction))
+    down_goRegionDMRStage <- RunMethylEnrichment(stageDMR[stageDMR$p.adjust < 0.001,], cpg_df=probes.trt.bmicont.df[,c("Name","CONTRAST")], 
+                                                 groupIsBackGroundSubset=TRUE, groupCol="CONTRAST",
+                                                 sig_cpgs=c("Z_STAGE_WEEKS"=1), cpg_level=FALSE, array.type="EPIC",
+                                                 pval_col="adj.P.Val", dir=godmr_dir, CpGCol="Name", extra=paste0(".",direction,"DMRStage"))
+    down_goRegionDMRSex   <- RunMethylEnrichment(sexDMR[sexDMR$p.adjust < 0.01,], cpg_df=probes.trt.bmicont.df[,c("Name","CONTRAST")], 
+                                                 groupIsBackGroundSubset=TRUE, groupCol="CONTRAST",
+                                                 sig_cpgs=c("sexmale - sexfemale"=1), cpg_level=FALSE, array.type="EPIC",
+                                                 pval_col="adj.P.Val", dir=godmr_dir, CpGCol="Name", extra=paste0(".",direction,"DMRSex"))
+    
+  # Else if all comparisons
+  } else if (direction == "all") {
+    
+    stageDMR <- stageTall_df
+    sexDMR <- sexTall_df
+    
+    # CpG-level
+    print(paste0("RUNNING FOR :- ",direction))
+    all_goRegionDMRStage <- RunMethylEnrichment(stageDMR[stageDMR$p.adjust < 0.001,], cpg_df=probes.trt.bmicont.df[,c("Name","CONTRAST")], 
+                                                groupIsBackGroundSubset=TRUE, groupCol="CONTRAST",
+                                                sig_cpgs=c("Z_STAGE_WEEKS"=1), cpg_level=FALSE, array.type="EPIC",
+                                                pval_col="adj.P.Val", dir=godmr_dir, CpGCol="Name", extra=paste0(".",direction,"DMRStage"))
+    all_goRegionDMRSex   <- RunMethylEnrichment(sexDMR[sexDMR$p.adjust < 0.01,], cpg_df=probes.trt.bmicont.df[,c("Name","CONTRAST")], 
+                                                groupIsBackGroundSubset=TRUE, groupCol="CONTRAST",
+                                                sig_cpgs=c("sexmale - sexfemale"=1), cpg_level=FALSE, array.type="EPIC",
+                                                pval_col="adj.P.Val", dir=godmr_dir, CpGCol="Name", extra=paste0(".",direction,"DMRSex"))
+    
+  }
+  
+}
+
+```
+
+### Plot
+
+#### CpGs
+
+```{r}
+
+PlotTopEnrichTerms <- function(df, sortCol, topN=10, outDir="./", extraDetails="_go", ...) {
+  
+  # If any sig terms
+  if (nrow(df) > 0) {
+
+    # Order
+    df <- df[order(df[[sortCol]], decreasing=ifelse(sortCol == "FDR", FALSE, TRUE)),]
+    
+    # Subset, accounting for when less than topN sig terms
+    if (nrow(df) >= topN) { df <- df[1:topN,] }
+      
+    # Plot
+    plt <- ggplot(df, aes(x=reorder(TERM,-log10(FDR)), y=-log10(FDR), fill=FOLD_ENRICHMENT, size=log2(N))) + 
+                  geom_point(stat="identity", shape=21) + 
+                  scale_fill_continuous(high="red",low="blue") +
+                  xlab("") +
+                  theme_bw(base_size=16) + theme(axis.text.x=element_text(angle=90, hjust=1, vjust=0.5),
+                                                 legend.position="top",
+                                                 axis.title.y=element_text(size=24),legend.key.size = unit(1.5, "cm"))
+    
+    # Save
+    ggsave(paste0(outDir, "dotPlot_top",topN,"Terms_by",sortCol,extraDetails,"Results.pdf"), plt, units="px", device="pdf", dpi=300, ...)
+    ggsave(paste0(outDir, "dotPlot_top",topN,"Terms_by",sortCol,extraDetails,"Results.png"), plt, units="px", device="png", dpi=300, ...)
+    
+    # View plot
+    return(plt)
+    
+  }
+}
+
+# Plot
+## Stage
+### All
+PlotTopEnrichTerms(df=all_goMethCpG_trt[all_goMethCpG_trt$FDR < 0.05 & all_goMethCpG_trt$CONTRAST == "Z_STAGE_WEEKS" & all_goMethCpG_trt$ONTOLOGY == "BP",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_allStageCpGs_goBP", width=4000, height=3250)
+PlotTopEnrichTerms(df=all_goMethCpG_trt[all_goMethCpG_trt$FDR < 0.05 & all_goMethCpG_trt$CONTRAST == "Z_STAGE_WEEKS" & all_goMethCpG_trt$ONTOLOGY == "MF",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_allStageCpGs_goMF", width=4000, height=3250)
+PlotTopEnrichTerms(df=all_goMethCpG_trt[all_goMethCpG_trt$FDR < 0.05 & all_goMethCpG_trt$CONTRAST == "Z_STAGE_WEEKS" & all_goMethCpG_trt$ONTOLOGY == "CC",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_allStageCpGs_goCC", width=4000, height=3250)
+
+### Up
+PlotTopEnrichTerms(df=up_goMethCpG_trt[up_goMethCpG_trt$FDR < 0.05 & up_goMethCpG_trt$CONTRAST == "Z_STAGE_WEEKS" & up_goMethCpG_trt$ONTOLOGY == "BP",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_upStageCpGs_goBP", width=4000, height=3250)
+PlotTopEnrichTerms(df=up_goMethCpG_trt[up_goMethCpG_trt$FDR < 0.05 & up_goMethCpG_trt$CONTRAST == "Z_STAGE_WEEKS" & up_goMethCpG_trt$ONTOLOGY == "MF",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_upStageCpGs_goMF", width=4000, height=3250)
+PlotTopEnrichTerms(df=up_goMethCpG_trt[up_goMethCpG_trt$FDR < 0.05 & up_goMethCpG_trt$CONTRAST == "Z_STAGE_WEEKS" & up_goMethCpG_trt$ONTOLOGY == "CC",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_upStageCpGs_goCC", width=4000, height=3250)
+
+### Down
+PlotTopEnrichTerms(df=down_goMethCpG_trt[down_goMethCpG_trt$FDR < 0.05 & down_goMethCpG_trt$CONTRAST == "Z_STAGE_WEEKS" & down_goMethCpG_trt$ONTOLOGY == "BP",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_downStageCpGs_goBP", width=4000, height=3250)
+PlotTopEnrichTerms(df=down_goMethCpG_trt[down_goMethCpG_trt$FDR < 0.05 & down_goMethCpG_trt$CONTRAST == "Z_STAGE_WEEKS" & down_goMethCpG_trt$ONTOLOGY == "MF",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_downStageCpGs_goMF", width=4000, height=3250)
+PlotTopEnrichTerms(df=down_goMethCpG_trt[down_goMethCpG_trt$FDR < 0.05 & down_goMethCpG_trt$CONTRAST == "Z_STAGE_WEEKS" & down_goMethCpG_trt$ONTOLOGY == "CC",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_downStageCpGs_goCC", width=4000, height=3250)
+
+## Sex
+### All
+PlotTopEnrichTerms(df=all_goMethCpG_eby[all_goMethCpG_eby$FDR < 0.05 & all_goMethCpG_eby$CONTRAST == "sexmale - sexfemale" & all_goMethCpG_eby$ONTOLOGY == "BP",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_allSexCpGs_goBP", width=4000, height=3250)
+PlotTopEnrichTerms(df=all_goMethCpG_eby[all_goMethCpG_eby$FDR < 0.05 & all_goMethCpG_eby$CONTRAST == "sexmale - sexfemale" & all_goMethCpG_eby$ONTOLOGY == "MF",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_allSexCpGs_goMF", width=4000, height=3250)
+PlotTopEnrichTerms(df=all_goMethCpG_eby[all_goMethCpG_eby$FDR < 0.05 & all_goMethCpG_eby$CONTRAST == "sexmale - sexfemale" & all_goMethCpG_eby$ONTOLOGY == "CC",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_allSexCpGs_goCC", width=4000, height=3250)
+
+### Up
+PlotTopEnrichTerms(df=up_goMethCpG_eby[up_goMethCpG_eby$FDR < 0.05 & up_goMethCpG_eby$CONTRAST == "sexmale - sexfemale" & up_goMethCpG_eby$ONTOLOGY == "BP",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_upSexCpGs_goBP", width=4000, height=3250)
+PlotTopEnrichTerms(df=up_goMethCpG_eby[up_goMethCpG_eby$FDR < 0.05 & up_goMethCpG_eby$CONTRAST == "sexmale - sexfemale" & up_goMethCpG_eby$ONTOLOGY == "MF",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_upSexCpGs_goMF", width=4000, height=3250)
+PlotTopEnrichTerms(df=up_goMethCpG_eby[up_goMethCpG_eby$FDR < 0.05 & up_goMethCpG_eby$CONTRAST == "sexmale - sexfemale" & up_goMethCpG_eby$ONTOLOGY == "CC",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_upSexCpGs_goCC", width=4000, height=3250)
+
+### Down
+PlotTopEnrichTerms(df=down_goMethCpG_eby[down_goMethCpG_eby$FDR < 0.05 & down_goMethCpG_eby$CONTRAST == "sexmale - sexfemale" & down_goMethCpG_eby$ONTOLOGY == "BP",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_downSexCpGs_goBP", width=4000, height=3250)
+PlotTopEnrichTerms(df=down_goMethCpG_eby[down_goMethCpG_eby$FDR < 0.05 & down_goMethCpG_eby$CONTRAST == "sexmale - sexfemale" & down_goMethCpG_eby$ONTOLOGY == "MF",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_downSexCpGs_goMF", width=4000, height=3250)
+PlotTopEnrichTerms(df=down_goMethCpG_eby[down_goMethCpG_eby$FDR < 0.05 & down_goMethCpG_eby$CONTRAST == "sexmale - sexfemale" & down_goMethCpG_eby$ONTOLOGY == "CC",], 
+                   sortCol="FDR", topN=10, outDir=gocpg_dir, extraDetails="_downSexCpGs_goCC", width=4000, height=3250)
+
+```
+
+#### DMRs
+
+```{r}
+
+# Plot
+## Stage
+### All
+PlotTopEnrichTerms(df=all_goRegionDMRStage[all_goRegionDMRStage$FDR < 0.05 & all_goRegionDMRStage$CONTRAST == "Z_STAGE_WEEKS" & all_goRegionDMRStage$ONTOLOGY == "BP",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_allStageDMRs_goBP", width=4000, height=3250)
+PlotTopEnrichTerms(df=all_goRegionDMRStage[all_goRegionDMRStage$FDR < 0.05 & all_goRegionDMRStage$CONTRAST == "Z_STAGE_WEEKS" & all_goRegionDMRStage$ONTOLOGY == "MF",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_allStageDMRs_goMF", width=4000, height=3250)
+PlotTopEnrichTerms(df=all_goRegionDMRStage[all_goRegionDMRStage$FDR < 0.05 & all_goRegionDMRStage$CONTRAST == "Z_STAGE_WEEKS" & all_goRegionDMRStage$ONTOLOGY == "CC",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_allStageDMRs_goCC", width=4000, height=3250)
+
+### Up
+PlotTopEnrichTerms(df=up_goRegionDMRStage[up_goRegionDMRStage$FDR < 0.05 & up_goRegionDMRStage$CONTRAST == "Z_STAGE_WEEKS" & up_goRegionDMRStage$ONTOLOGY == "BP",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_upStageDMRs_goBP", width=4000, height=3250)
+PlotTopEnrichTerms(df=up_goRegionDMRStage[up_goRegionDMRStage$FDR < 0.05 & up_goRegionDMRStage$CONTRAST == "Z_STAGE_WEEKS" & up_goRegionDMRStage$ONTOLOGY == "MF",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_upStageDMRs_goMF", width=4000, height=3250)
+PlotTopEnrichTerms(df=up_goRegionDMRStage[up_goRegionDMRStage$FDR < 0.05 & up_goRegionDMRStage$CONTRAST == "Z_STAGE_WEEKS" & up_goRegionDMRStage$ONTOLOGY == "CC",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_upStageDMRs_goCC", width=4000, height=3250)
+
+### Down
+PlotTopEnrichTerms(df=down_goRegionDMRStage[down_goRegionDMRStage$FDR < 0.05 & down_goRegionDMRStage$CONTRAST == "Z_STAGE_WEEKS" & down_goRegionDMRStage$ONTOLOGY == "BP",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_downStageDMRs_goBP", width=4000, height=3250)
+PlotTopEnrichTerms(df=down_goRegionDMRStage[down_goRegionDMRStage$FDR < 0.05 & down_goRegionDMRStage$CONTRAST == "Z_STAGE_WEEKS" & down_goRegionDMRStage$ONTOLOGY == "MF",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_downStageDMRs_goMF", width=4000, height=3250)
+PlotTopEnrichTerms(df=down_goRegionDMRStage[down_goRegionDMRStage$FDR < 0.05 & down_goRegionDMRStage$CONTRAST == "Z_STAGE_WEEKS" & down_goRegionDMRStage$ONTOLOGY == "CC",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_downStageDMRs_goCC", width=4000, height=3250)
+
+## Sex
+### All
+PlotTopEnrichTerms(df=all_goRegionDMRSex[all_goRegionDMRSex$FDR < 0.05 & all_goRegionDMRSex$CONTRAST == "sexmale - sexfemale" & all_goRegionDMRSex$ONTOLOGY == "BP",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_allSexDMRs_goBP", width=4000, height=3250)
+PlotTopEnrichTerms(df=all_goRegionDMRSex[all_goRegionDMRSex$FDR < 0.05 & all_goRegionDMRSex$CONTRAST == "sexmale - sexfemale" & all_goRegionDMRSex$ONTOLOGY == "MF",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_allSexDMRs_goMF", width=4000, height=3250)
+PlotTopEnrichTerms(df=all_goRegionDMRSex[all_goRegionDMRSex$FDR < 0.05 & all_goRegionDMRSex$CONTRAST == "sexmale - sexfemale" & all_goRegionDMRSex$ONTOLOGY == "CC",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_allSexDMRs_goCC", width=4000, height=3250)
+
+### Up
+PlotTopEnrichTerms(df=up_goRegionDMRSex[up_goRegionDMRSex$FDR < 0.05 & up_goRegionDMRSex$CONTRAST == "sexmale - sexfemale" & up_goRegionDMRSex$ONTOLOGY == "BP",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_upSexDMRs_goBP", width=4000, height=3250)
+PlotTopEnrichTerms(df=up_goRegionDMRSex[up_goRegionDMRSex$FDR < 0.05 & up_goRegionDMRSex$CONTRAST == "sexmale - sexfemale" & up_goRegionDMRSex$ONTOLOGY == "MF",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_upSexDMRs_goMF", width=4000, height=3250)
+PlotTopEnrichTerms(df=up_goRegionDMRSex[up_goRegionDMRSex$FDR < 0.05 & up_goRegionDMRSex$CONTRAST == "sexmale - sexfemale" & up_goRegionDMRSex$ONTOLOGY == "CC",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_upSexDMRs_goCC", width=4000, height=3250)
+
+### Down
+PlotTopEnrichTerms(df=down_goRegionDMRSex[down_goRegionDMRSex$FDR < 0.05 & down_goRegionDMRSex$CONTRAST == "sexmale - sexfemale" & down_goRegionDMRSex$ONTOLOGY == "BP",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_downSexDMRs_goBP", width=4000, height=3250)
+PlotTopEnrichTerms(df=down_goRegionDMRSex[down_goRegionDMRSex$FDR < 0.05 & down_goRegionDMRSex$CONTRAST == "sexmale - sexfemale" & down_goRegionDMRSex$ONTOLOGY == "MF",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_downSexDMRs_goMF", width=4000, height=3250)
+PlotTopEnrichTerms(df=down_goRegionDMRSex[down_goRegionDMRSex$FDR < 0.05 & down_goRegionDMRSex$CONTRAST == "sexmale - sexfemale" & down_goRegionDMRSex$ONTOLOGY == "CC",], 
+                   sortCol="FDR", topN=10, outDir=godmr_dir, extraDetails="_downSexDMRs_goCC", width=4000, height=3250)
+
+```
+
+## sessionInfo
+
+```{r}
+writeLines(capture.output(sessionInfo()), paste0(log_dir,"methylation_sessionInfo.txt"))
+```

@@ -1,0 +1,189 @@
+---
+title: "matrixQTL preparation"
+output: html_notebook
+---
+
+
+## Code
+
+### Load the libraries
+```{r}
+library(rtracklayer)
+library(dplyr)
+library(stringr)
+```
+
+
+
+### Directories
+
+```{r}
+
+# Defined main dir
+scripts_dir <- getwd()
+main_dir <- scripts_dir
+data_dir <-"rawdata/"
+qced_dir <- "qced_data/"
+res_dir <- "results/"
+plink_dir <-  "qced_data/merged/"
+mqtl_dir <- "mqtl/"
+imp_dir <- "results/imputation/plink/"
+log_dir <-"logs/"
+
+```
+
+### Read in data
+
+```{r}
+#read in the saved plink data
+imput_data.df <- readRDS(paste0(imp_dir,"imputed.hrc.read_into_R.rds"))
+
+# Read in metadata
+metadata <- read.table(paste0(res_dir,"methylation_sample_metadata.tsv"), sep="\t", header=TRUE)
+```
+
+### Remove the sex mismatch sample
+
+```{r}
+imput_data.df <- imput_data.df[,colnames(imput_data.df) != "X15213"]
+```
+
+```{r}
+
+# Read in methylation data
+meth_m <- read.table(paste0(res_dir,"methylation_matrix.mvals.tsv"), sep="\t", header=TRUE)
+meth_beta <- read.table(paste0(res_dir,"methylation_matrix.betavals.tsv"), sep="\t", header=TRUE)
+colnames(meth_m) <- gsub("^X","",colnames(meth_m)); colnames(meth_m)[[1]] <- "id"
+colnames(meth_beta) <- gsub("^X","",colnames(meth_beta)); colnames(meth_beta)[[1]] <- "id"
+
+# Read in methylation annotation data
+meth_annot.df <- read.table(paste0(res_dir,"methylation_probe_data.tsv"), sep="\t", header=TRUE, quote="")
+meth_annot.df <- meth_annot.df[which(meth_annot.df$Name %in% meth_m$id),]
+ 
+```
+
+### get the data for GWAS coloc
+
+```{r}
+#read in the gwas use all phenotypes
+regions <- read.delim(paste0(mqtl_dir,"gwasRegions.txt"))
+# regions <- regions[ grepl("AllOA|KneeOA|TJR|FingerOA|HandOA|ThumbOA|HipOA|KneeHipOA|TKR|THR",regions$Osteoarthritis.phenotype)|grepl("AllOA|KneeOA|TJR|FingerOA|HandOA|ThumbOA|HipOA|KneeHipOA|TKR|THR",regions$Other.osteoarthritis.phenotypes),]
+
+#function to return the SNP IDs near the signal snps
+getNearbySNPs <- function(region,snpLocs){
+  
+  #get the region signal snp chr and positions
+
+  pos <- as.numeric(word(region,start = 2,sep=":"))
+  chr <- word(region,start = 1,sep=":")
+  # chr <- paste0("chr",chr)
+   
+   #get the gwas summary data for 500kp up and downstream
+   snpLocs <- snpLocs[ snpLocs$chr==chr &  snpLocs$pos <= pos+500000 & snpLocs$pos >= pos-500000,"marker"]
+   
+   return(snpLocs)
+  
+}
+
+#want to get the list of snps nearby for coloc analysis
+#note need all the snps (pvaluethreshold=1) so will run mqtl analysis seperately for just those snps that are nearby to the signal snps
+nearbySNPs <- unique(unlist(sapply(regions$Chr.pos,getNearbySNPs,imput_data.df)))
+
+```
+
+### extra MAF filtering
+
+```{r}
+all_snps.df <- imput_data.df%>% relocate(CHRPOSID)
+
+#increase the stringency of the maf filtering if required
+selectedMAF <- 0.05
+
+getMAFs <- function(dosages){
+  mafs <- rowMeans(dosages,na.rm = TRUE)/2
+  mafs <- ifelse(mafs>0.5, 1-mafs, mafs)
+  return(mafs)
+}
+
+#function to filter the SNP dataset by a selected maf threshold
+filterMAFs <- function(dataset,threshold=0.05){
+  
+  mafs <- getMAFs(dataset[,-1:-7])
+  dataset <- dataset[mafs>threshold,]
+  return(dataset)
+  
+}
+
+all_snps.df <-  filterMAFs(all_snps.df,selectedMAF)
+
+```
+
+
+```{r}
+
+# Save 
+## All SNPs
+### Dataset without outliers
+colnames(all_snps.df)[1] <- "id"
+colnames(all_snps.df) <- gsub("^X","",colnames(all_snps.df))
+all_snps.df <- all_snps.df[,!colnames(all_snps.df) %in% c("marker","chr","cM","pos","alt","ref")]
+write.table(all_snps.df, paste0(mqtl_dir,"snp_matrix.for_mqtl.all.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+##Dataset just for GWAS coloc
+coloc.snps.df <- all_snps.df[all_snps.df$id %in% nearbySNPs,]
+
+write.table(coloc.snps.df, paste0(mqtl_dir,"snp_matrix.for_mqtl.coloc.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+
+#read in the pca data
+pcaDat <- read.delim("results/genotyping_pca_metadata.tsv")
+pcaDat <- pcaDat[ pcaDat$Superpopulation=="CurrentStudy",c("SampleID","PC1","PC2","PC3","PC4")]
+
+
+
+saveCovariates <- function(numPC=0, metadata,pcaDat) {
+
+  cov_data <- metadata[,c("Sample_Name","Batch", "sex", "stage_weeks")]
+  cov_data$Sample_Name <- gsub("X","",cov_data$Sample_Name)
+  
+  if(numPC>0){
+   selectPCs <- paste0("PC",1:numPC)
+   pcaDat <- pcaDat[,c("SampleID",selectPCs)]
+   cov_data <- merge(cov_data,pcaDat,by.x="Sample_Name",by.y="SampleID")
+  }
+
+  
+
+  # Format covariates and save
+  cov_data <- t(cov_data); colnames(cov_data) <- metadata$Sample_Name
+  cov_data["Batch",] <- as.numeric(as.factor(cov_data["Batch",]))
+  cov_data["sex",] <- as.numeric(as.factor(cov_data["sex",]))
+  
+  write.table(cov_data, sprintf("%scovariates.for_mqtl_numPC%s.tsv",mqtl_dir,numPC), sep="\t", quote=FALSE, col.names=NA)
+
+}
+
+numPCs <- 0:4
+savedFiles <- sapply(numPCs,saveCovariates,metadata,pcaDat)
+
+
+# Get position file
+imp.snp_loc.df <- data.frame(snp=imput_data.df$marker, chr=paste0("chr",imput_data.df$chr), pos=imput_data.df$pos)
+imp.meth_loc.df <- data.frame(snp=meth_annot.df$Name, chr=meth_annot.df$chr, pos=meth_annot.df$pos, pos=meth_annot.df$pos)
+
+write.table(imp.snp_loc.df, paste0(mqtl_dir, "snp_location.for_mqtl.imputed.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(imp.meth_loc.df, paste0(mqtl_dir, "methylation_location.for_mqtl.imputed.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+rownames(meth_annot.df) <- meth_annot.df$Name
+
+write.table(meth_m[which(meth_m$id %in% as.character(rownames(meth_annot.df))),], paste0(mqtl_dir,"methylation_matrix.for_mqtl.imputed.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+
+
+#save the objects for the analysis post-processing
+saveRDS(list(imp.meth_annot.df=meth_annot.df,
+              colocSNPs=nearbySNPs),
+        file=paste0(data_dir,"matrixQTL_prep.RDS"))
+
+```
+

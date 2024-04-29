@@ -1,0 +1,317 @@
+---
+title: "TF enrichment in DMRs"
+author: "Jamie Soul"
+date: today
+date-format: short
+format:
+  html:
+    self-contained: true
+    theme: litera
+    toc: true
+    toc-depth: 4
+editor: visual
+echo: false
+code-block-bg: true
+code-block-border-left: "#31BAE9"
+---
+
+### Load the libraries
+
+```{r}
+#| output: false
+library(monaLisa)
+library(GenomicRanges)
+library(SummarizedExperiment)
+library(TFBSTools)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(BiocParallel)
+library(stringr)
+library(JASPAR2020)
+library(circlize)
+library(ComplexHeatmap)
+library(jsonlite)
+library(dplyr)
+```
+
+### Load the data
+
+Load in the DMR table for developmental stage.
+
+```{r}
+dmrs <- read.delim("results/dmr/dmrff_results.stage_as_continuous.treat_log2FC0.1unfiltered.tsv")
+dmrs <- dmrs[ dmrs$n>1,]
+dmrs <- GRanges(dmrs)
+
+head(dmrs)
+```
+
+### Bin the DMRs by estimate
+
+We use the estimate values to bin the dmrs into roughly equally sized bins.
+
+```{r}
+# bin using with a zero group
+bins <- bin(x = dmrs$estimate, binmode = "equalN", nElement = 1000, 
+            minAbsX = 0.5)
+
+#for the file
+png("dDMR_bins.png",width = 7, height=7, units="in", res=600)
+plotBinDensity(dmrs$estimate, bins, legend = "top",xlab="Estimate")
+title("dDMR bins by Estimate")
+dev.off()
+
+#for the report
+plotBinDensity(dmrs$estimate, bins, legend = "top",xlab="Estimate")
+title("dDMR bins by Estimate")
+```
+
+### Get the motif libraries
+
+hocomoco12 - https://hocomoco12.autosome.org/ Has coverage of 949 transcription factors graded by quality. We select those with A-C quality for motif enrichment.
+
+```{r}
+#| warning: false
+
+#functions taken from the learnMotif package and modified to return a PWM
+#https://github.com/mPloenzke/learnMotifs
+processHOCOMOCOText <- function(text){
+  DNA_BASES <- c('A','C','G','T')
+  ID <- sub("^>", "", strsplit(text[1], "\t")[[1]][1])
+  name <- ID
+  profileMatrix <- do.call(rbind,strsplit(text[2:5], "\t"))
+  mode(profileMatrix) <- "integer"
+  rownames(profileMatrix) <- DNA_BASES
+  ans <- PWMatrix(ID=ID, name=name, profileMatrix=profileMatrix)
+  ans <- toPWM(ans)
+  
+}
+
+my_readHOCOMOCOMatrix <- function(fn, type=c("individual", "all")){
+  type <- match.arg(type)
+  text <- readLines(fn)
+  if(type == "individual"){
+    if(length(text) != 5L){
+      stop("The `individual` format is supposed to have 5 lines!")
+    }
+    ans <- processHOCOMOCOText(text)
+  }else{
+    if(length(text) %% 5 != 0L){
+      stop("The `all` format is supposed to have a number of lines",
+           "mutipled by 5!")
+    }
+    text2 <- split(text, rep(1:(length(text)/5), rep(5, length(text)/5)))
+    ans <- lapply(text2, processHOCOMOCOText)
+    ans.mot <- lapply(ans, function(i) {slot(i,'profileMatrix')})
+    names(ans.mot) <- lapply(ans, function(i) {slot(i,'name')})
+  }
+  return(ans)
+}
+
+#text file downloaded
+#"https://hocomoco12.autosome.org/final_bundle/hocomoco12/H12CORE/formatted_motifs/H12CORE_jaspar_format.txt"
+pwms <- my_readHOCOMOCOMatrix("H12CORE_jaspar_format.txt","all")
+
+pwms <- do.call(PWMatrixList,pwms)
+names(pwms) <- sapply(pwms,name)
+#filter by the primary TF binding motif only
+mode <- as.numeric(word(names(pwms),3,sep = "\\."))
+pwms <- pwms[ mode==0]
+
+quality <- word(names(pwms),5,sep = "\\.")
+pwms <- pwms[ quality != "D"]
+
+pwms
+```
+
+JASPAR provides a smaller collection of vertebrate motifs
+
+```{r}
+pwmsJASPAR <- getMatrixSet(JASPAR2020,
+                     opts = list(matrixtype = "PWM",
+                                 tax_group = "vertebrates"))
+
+pwmsJASPAR
+```
+
+### Bin diagnostics
+
+Want to check that the bins have comparable GC, length, and dnnucfreqs. There are biases in the dinucfreq so we need to think about that when interpreting the enriched motifs.
+
+```{r}
+dmrseqs <- getSeq(BSgenome.Hsapiens.UCSC.hg19,dmrs)
+
+plotBinDiagnostics(seqs = dmrseqs, bins = bins, aspect = "GCfrac")
+plotBinDiagnostics(seqs = dmrseqs, bins = bins, aspect = "length")
+plotBinDiagnostics(seqs = dmrseqs, bins = bins, aspect = "dinucfreq")
+```
+
+### Trim the dmrs to fixed length
+
+Will use the median DMR size as a fixed size around the centre of each the DMR to make each bin more comparable
+
+#### Before
+
+```{r}
+summary(width(dmrs))
+dmrs <- trim(resize(dmrs, width = median(width(dmrs)), fix = "center"))
+dmrseqs <- getSeq(BSgenome.Hsapiens.UCSC.hg19,dmrs)
+```
+
+#### After
+
+```{r}
+summary(width(dmrs))
+```
+
+### Get the enrichment for the motif libraries using all other bins as the background
+
+```{r}
+#| output: false
+
+set.seed(42)
+seHOMO <- calcBinnedMotifEnrR(seqs = dmrseqs, bins = bins,
+                          pwmL = pwms,BPPARAM = SerialParam(),
+                          verbose = TRUE)
+
+seJASPAR <- calcBinnedMotifEnrR(seqs = dmrseqs, bins = bins,
+                          pwmL = pwmsJASPAR,BPPARAM = SerialParam(),
+                          verbose = TRUE)
+```
+
+### Summarise the results
+
+```{r}
+
+#get the gene symbols for the models
+#https://hocomoco12.autosome.org/final_bundle/hocomoco12/H12CORE/H12CORE_annotation.jsonl
+lines <- readLines("H12CORE_annotation.jsonl")
+lines <- lapply(lines, fromJSON)
+lines <- lapply(lines, unlist)
+motif2gene <- bind_rows(lines) %>% as.data.frame()
+
+getSummaryTable <- function(obj,motif2gene){
+  
+  #get the padj table
+  ind <- which(assayNames(obj)=="negLog10Padj")
+  pvalueTable <- assay(obj,ind)
+  pvalueTable[ is.na(pvalueTable)] <- 0
+  
+  #get the best bin and covert to pvalue
+  topHit <- rowMax(pvalueTable)
+  topHit <- 10^-topHit
+  
+  #get the top bin name
+  topBin <- colnames(pvalueTable)[apply(pvalueTable,1,which.max)]
+  
+  #get the gene name from the motif
+  geneNames <- motif2gene[match(rownames(pvalueTable),motif2gene$name),"masterlist_info.species.HUMAN.gene_symbol"]
+  
+  #make the summary table
+  summaryTable <- data.frame(TFMotif=rownames(pvalueTable),GeneName=geneNames,topLog2FoldChangeBin=topBin,padj=topHit)
+  
+  return(summaryTable)
+  
+}
+
+summaryTable.hocomoco <- getSummaryTable(seHOMO,motif2gene)
+
+
+write.table(summaryTable.hocomoco, file="results/dmr/summaryTable.hocomoco.txt", sep="\t", quote=FALSE, row.names=FALSE)
+
+
+```
+
+### Heatmap of sig enriched motifs
+
+We can visualise the enrichment and the significance values for the significantly enriched TF motifs.
+
+```{r}
+rowData(seHOMO)$motif.name <-  motif2gene[match(rowData(seHOMO)$motif.name,motif2gene$name),"masterlist_info.species.HUMAN.gene_symbol"]
+
+
+getHeatmap <- function(se,motifLib){
+  
+  #get those motifs sig in at least one bin
+  sel <- apply(assay(se, "negLog10Padj"), 1, 
+               function(x) max(abs(x), 0, na.rm = TRUE)) > -log10(0.05)
+  
+  print(length(which(sel)))
+  
+  #filter the results by those sig motifs
+  seSel <- se[sel, ]
+  
+  # plot the heatmaps with and with the motif seq logos
+  # rowData(seSel)$motif.name <- word(rowData(seSel)$motif.name,1,sep = "\\.")
+  
+  png(sprintf("dDMR_%s_heatmap.png",motifLib),width = 7, height=9, units="in", res=600)
+  heatmap <- plotMotifHeatmaps(x = seSel, which.plots = c("log2enr", "negLog10Padj"), 
+                    width = 2.0, cluster = TRUE, maxEnr = 2, maxSig = 10, 
+                    show_motif_GC = TRUE)
+  heatmap
+  heatmap <- Reduce(ComplexHeatmap::add_heatmap, heatmap)
+  dev.off()
+  
+  SimMatSel <- motifSimilarity(rowData(seSel)$motif.pfm)
+  hcl <- hclust(as.dist(1 - SimMatSel), method = "average")
+  
+  png(sprintf("dDMR_%s_heatmapWithMotifs.png",motifLib),width = 12, height=9, units="in", res=600)
+  heatMapWithMotif <- plotMotifHeatmaps(x = seSel, which.plots = c("log2enr", "negLog10Padj"), 
+                    width = 1.8, cluster = hcl, maxEnr = 2, maxSig = 10,
+                    show_dendrogram = TRUE, show_seqlogo = TRUE,
+                    width.seqlogo = 2)
+  heatMapWithMotif
+  heatMapWithMotif <-  Reduce(ComplexHeatmap::add_heatmap, heatMapWithMotif)
+  dev.off()
+ 
+ return(list(heatmap=heatmap,heatMapWithMotif=heatMapWithMotif))
+  
+}
+heatmapsHOMO <- getHeatmap(seHOMO,"hocomoco")
+heatmapsJASPAR <- getHeatmap(seJASPAR,"JASPAR")
+
+```
+
+#### Hocomoco
+
+hocomoco heatmap clustered by the enrichment scores
+
+```{r}
+#| fig-width: 7
+#| fig-height: 9
+
+png("results/dmr/heatmapsHOMO.png",width = 8,height = 12,units="in",res=600)
+heatmapsHOMO$heatmap
+dev.off()
+
+heatmapsHOMO$heatmap
+```
+
+hocomoco heatmap clustered by the motif similarity
+
+```{r}
+#| fig-width: 9
+#| fig-height: 10
+
+png("results/dmr/heatmapsHOMOWithMotifs.png",width = 8,height = 14,units="in",res=600)
+heatmapsHOMO$heatMapWithMotif
+dev.off()
+heatmapsHOMO$heatMapWithMotif
+```
+
+#### JASPAR
+
+jaspar heatmap clustered by the enrichment scores
+
+```{r}
+#| fig-width: 7
+#| fig-height: 13
+heatmapsJASPAR$heatmap
+```
+
+jaspar heatmap clustered by the motif similarity
+
+```{r}
+#| fig-width: 9
+#| fig-height: 13
+heatmapsJASPAR$heatMapWithMotif
+```

@@ -1,0 +1,105 @@
+---
+title: "Supplementry mQTL analysis"
+format: html
+editor: visual
+---
+
+## Load libraries
+
+```{r}
+library(tidyverse)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+```
+
+## Load the mqtl data
+
+```{r}
+#tidyverse read_csv can transparently read gz csv files
+#https://epigenetics.essex.ac.uk/mQTL/All_Imputed_BonfSignificant_mQTLs.csv.gz
+brainMQTLs <- read_csv("All_Imputed_BonfSignificant_mQTLs.csv.gz")
+
+#get the cartilage foetal mqtls
+cartilageMQTLs <- read_delim("mqtl/mqtl_analysis.cis_mqtls.genomewide.tsv") %>% as.data.frame()
+
+cartilageMQTLs_OA <- read_delim("mqtl/mqtl_analysis.cis_mqtls.genomewide.OA.tsv") %>% as.data.frame()
+
+
+```
+
+## Comparison to dDMPs
+
+Is there significant overlap between the developmentally altered CpGs and the mQTLs?
+
+```{r}
+dmps <- read_delim("differential_methylation/differential_methylation.limma_results.continuous_covariates.treat_log2FC0.1_thr.tsv") %>% 
+  dplyr::filter(CONTRAST == "Z_STAGE_WEEKS") %>%
+  as.data.frame()
+
+cartilageMQTLs_sig <- cartilageMQTLs[ cartilageMQTLs$bonferroni <= 0.05,]
+dmps_sig <- dmps[ dmps$adj.P.Val <= 0.05,]
+
+overlapSize <- length(intersect(dmps_sig$Name,cartilageMQTLs_sig$gene))
+numbermQTLCpGs <- length(unique(cartilageMQTLs_sig$gene))
+numberDMPs <- nrow(dmps_sig)
+numberBackgroundCpGs <- nrow(dmps)
+
+
+#test for under-representation
+phyper(q = overlapSize,
+                 m = numbermQTLCpGs,
+                 n = numberBackgroundCpGs - numbermQTLCpGs,
+                 k = numberDMPs,
+                 lower.tail = TRUE)
+
+```
+
+## Comparison to sDMPs
+
+Is there significant overlap between the developmentally altered CpGs and the mQTLs?
+
+```{r}
+dmps <- read_delim("differential_methylation/differential_methylation.limma_results.continuous_covariates.ebayes_adjusted.tsv") %>% 
+  dplyr::filter(CONTRAST == "sexmale - sexfemale") %>%
+  as.data.frame()
+
+cartilageMQTLs_sig <- cartilageMQTLs[ cartilageMQTLs$bonferroni <= 0.05,]
+dmps_sig <- dmps[ dmps$adj.P.Val <= 0.05,]
+
+overlapSize <- length(intersect(dmps_sig$Name,cartilageMQTLs_sig$gene))
+numbermQTLCpGs <- length(unique(cartilageMQTLs_sig$gene))
+numberDMPs <- nrow(dmps_sig)
+numberBackgroundCpGs <- nrow(dmps)
+
+
+#test for under-representation
+phyper(q = overlapSize,
+                 m = numbermQTLCpGs,
+                 n = numberBackgroundCpGs - numbermQTLCpGs,
+                 k = numberDMPs,
+                 lower.tail = TRUE)
+
+```
+## Comparison to foetal brain mQTLs
+
+Take all the epigenome wide significant CpGs, filter by those also on the 450K array, and compare Y/N if they were also an mQTL in the brain paper
+
+```{r}
+#check all the brain probes are on the 450k array as expected
+table(brainMQTLs$ProbeID %in% Manifest$Name)
+
+#filter the cartilage mqtls by those probes on the 450k array
+cartilageMQTLs <- cartilageMQTLs[ cartilageMQTLs$gene  %in% Manifest$Name,]
+
+#add a column with present or not in the sig brain mQTLs
+cartilageMQTLs$brain <- ifelse(cartilageMQTLs$gene %in% brainMQTLs$ProbeID,"yes","no")
+
+#get the sig cartilage mQTLs
+cartilageMQTLs_sig <- cartilageMQTLs[ cartilageMQTLs$bonferroni <= 0.05,]
+
+#how many cartilage mqtls are also sig in the brain dataset?
+freq <- table(cartilageMQTLs_sig$brain)
+freq[2]/sum(freq)
+
+write.table(cartilageMQTLs_sig, "mqtl_analysis.cis_mqtls.450k_probes.genomewide_bonerroni_sig.tsv", sep="\t", quote=FALSE,row.names = FALSE,col.names = TRUE)
+
+```

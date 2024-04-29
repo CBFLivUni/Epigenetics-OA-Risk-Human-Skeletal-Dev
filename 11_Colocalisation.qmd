@@ -1,0 +1,541 @@
+---
+title: "Colocalisation of GWAS regions and mQTLs"
+format: html
+editor: visual
+---
+
+## Load libraries
+
+```{r}
+library(tidyverse)
+library(coloc)
+library(cowplot)
+library(EnsDb.Hsapiens.v75)
+library(annotatr)
+```
+
+## Load the data
+
+```{r}
+#get the cartilage foetal mqtls for the regions of interest to be tested for colocalisation
+cartilageMQTLs <- read_delim("mqtl/mqtl_analysis.cis_mqtls.coloc.tsv")
+
+
+
+#Independent regions for the phenotypes of interest
+#From table 2 of https://doi.org/10.1016/j.cell.2021.07.038
+
+regions <- read.delim("mqtl/gwasRegions.txt")
+# regions <- regions[ grepl("AllOA|KneeOA|TJR",regions$Osteoarthritis.phenotype)| grepl("AllOA|KneeOA|TJR",regions$Other.osteoarthritis.phenotypes),]
+
+#function to get the maf from the minor allele dosages
+getMAFs <- function(dosages){
+   
+   mafs <- rowMeans(dosages)/2
+   mafs <- ifelse(mafs>0.5, 1-mafs, mafs)
+   
+   return(mafs)
+   
+}
+
+#get the snp table to calculate the mafs in our data for the mQTLs
+snptable <- read_delim("mqtl/snp_matrix.for_mqtl.all.tsv")
+
+```
+
+## Prepare the datasets
+
+```{r}
+
+#function to run coloc analysis for each cpg within a gwas region given the gwas phenotype info
+getColoc <- function(region,gwasSummary,mqtlSummary,cases,controls,probe=NULL){
+  
+   message(sprintf("running region %s",region["Chr.pos"]))
+   
+   #get the gwas region signal snp chr and positions
+   chr <- word(region["Chr.pos"],start = 1,sep=":")
+   pos <- as.numeric(word(region["Chr.pos"],start = 2,sep=":"))
+   
+   #get the gwas summary data for 500kp up and downstream
+   gwasRegion <- gwasSummary[ gwasSummary$Chromosome==chr &  gwasSummary$Position <= pos+500000 & gwasSummary$Position >= pos-500000,]
+   
+   #get the maf from the effect allele frequency and flip if > 0.5
+   gwasRegion$MAF <- ifelse(gwasRegion$EffectAlleleFrequency >= 0.5 , 1-gwasRegion$EffectAlleleFrequency,gwasRegion$EffectAlleleFrequency)
+   
+   #remove those snps with maf = 0
+   gwasRegion <- gwasRegion[gwasRegion$MAF>0,]
+   
+   #change the chr to match the mqtl style
+   gwasRegion$Chromosome <- paste0("chr",gwasRegion$Chromosome)
+   
+   #prepare the gwas dataset for coloc
+   #N=the number of samples
+   #s=the proportion of cases
+   GWASdataset <- list(pvalues= gwasRegion$Pvalue, MAF = gwasRegion$MAF, type = "cc", snp = paste(gwasRegion$Chromosome, gwasRegion$Position, sep = ":"), N=cases+controls,s=cases/controls,position=gwasRegion$Position)
+   
+   
+   #get the mqtl CpG probes (traits) that are between 500kp up and downstream
+   mqtlRegion <- mqtlSummary[ mqtlSummary$CpG_chr== paste0("chr",chr) &  mqtlSummary$CpG_position <= pos+500000 & mqtlSummary$CpG_position >= pos-500000,]
+   
+   #add chr to the mqtl snp
+   mqtlRegion$SNP_chr <-  paste0("chr", mqtlRegion$SNP_chr)
+   
+   #get the variance from the beta and statistic (sd is squareroot of var)
+   mqtlRegion$varbeta = (mqtlRegion$beta / mqtlRegion$statistic)^2
+   
+   #get the maf for the selected snps from the snp table
+   ind <- match(mqtlRegion$snps,snptable$id)
+   mqtlRegion$maf <- getMAFs(snptable[ind,-1])
+   
+   #remove any rows where beta is zero
+   mqtlRegion <- mqtlRegion[ mqtlRegion$beta!=0,]
+   
+   output <- NULL
+   
+   #where a probe of interest is known we want to return the coloc dataset for plotting
+   if(!is.null(probe)){
+      mQTL.sub <- mqtlRegion[which(mqtlRegion$CpG == probe),]
+      
+      #remove the cases where there are duplicated snps
+      mQTL.sub <- mQTL.sub[ !duplicated(mQTL.sub$SNP_pos),]
+      
+            mQTLDataset <- list(beta=mQTL.sub$beta,
+                             varbeta=mQTL.sub$varbeta,
+                             type = "quant",
+                             snp = paste(mQTL.sub$SNP_chr, mQTL.sub$SNP_pos, sep = ":"),position=mQTL.sub$SNP_pos,
+                             MAF = mQTL.sub$maf,
+                             N=71,
+                             pvalue=mQTL.sub$pvalue)
+      my.res <- coloc.abf(GWASdataset, mQTLDataset)
+      
+      return(list(my.res,mQTLDataset,GWASdataset))
+      
+   }
+   
+   #if not known
+   #loop through the probes in the genomic region
+   for(probe in unique(mqtlRegion$CpG)){
+      message(probe)
+      
+      #get the data for that probe
+      mQTL.sub <- mqtlRegion[which(mqtlRegion$CpG == probe),]   
+      mQTL.sub <- mQTL.sub[ !duplicated(mQTL.sub$SNP_pos),]
+
+      #prepare the dataset for that probe
+      if(nrow(mQTL.sub) > 1 ){
+         mQTLDataset <- list(beta=mQTL.sub$beta,
+                             varbeta=mQTL.sub$varbeta,
+                             type = "quant",
+                             snp = paste(mQTL.sub$SNP_chr, mQTL.sub$SNP_pos, sep = ":"),position=mQTL.sub$SNP_pos,
+                             MAF = mQTL.sub$maf,
+                             N=71)
+         
+         #need to check that there is some overlap in the snps
+         if(any(mQTLDataset$snp %in% GWASdataset$snp)){
+            #run coloc using the probe and gwas data
+            my.res <- coloc.abf(GWASdataset, mQTLDataset)
+            
+           output <- as.data.frame(rbind(output, c("region"=region["Chr.pos"], "trait2"=probe, my.res$summary)))
+         }
+      }
+   }
+   
+   
+   return(output)
+   
+}
+   
+#function to load the gwas summary statistics and run coloc analysis for that phenotype
+runCOLOC <- function(phenotype,case,control,regions,cartilageMQTLs,probe=NULL){
+   
+   #get the gwas regions for phenotype of interest
+   regions <- regions[ regions$Osteoarthritis.phenotype==phenotype | grepl(phenotype,regions$Other.osteoarthritis.phenotypes),]
+   
+   #get the gwas summary stats
+GWAS <- read_delim(sprintf("mqtl/KP.Format.GO.FILTER.GW.%s.FULL.09052019.txt",phenotype))
+
+   #run coloc analysis for each regions and nearby probes
+   results <- apply(regions,1,getColoc,GWAS,cartilageMQTLs,case,control,probe)
+   
+   #just return the coloc object if we want to plot the results for one probe of interest
+   if(!is.null(probe)) return(results)
+   
+   #combine all the results from the regions
+   results <- bind_rows(results)
+   results$PP.H4.abf <- as.numeric(results$PP.H4.abf)
+   
+   #filter by H4 >=0.8 that the mqtl and gwas region share a causal SNV
+   results.sig <- results[results$PP.H4.abf>=0.8,]
+   
+   #add back the GWAS SNP details
+   results.sig <- merge(results.sig,regions,by.y ="Chr.pos",by.x="region.Chr.pos")
+   return(results.sig)
+   
+}
+
+#phenotypes of interest
+phenotypes <- c("KneeOA","TJR","AllOA","FingerOA","HandOA","ThumbOA","HipOA","KneeHipOA","TKR","THR","SpineOA")
+
+#the cases and control numbers are taken from https://doi.org/10.1016/j.cell.2021.07.038
+cases <- c(62497,40887,177517,10804,20901,10536,36445,89741,18200,23021,28372)
+names(cases) <- phenotypes
+controls <- c(333557,327689,649173,255814,282881,236919,316943,400604,233841,296016,305578)
+names(controls) <- phenotypes
+
+#run coloc for each phenotype
+results <- mapply(runCOLOC,phenotypes,cases,controls,MoreArgs = list(regions=regions,cartilageMQTLs=cartilageMQTLs),SIMPLIFY = FALSE)
+
+#make one summary table
+results <- bind_rows(results,.id="Phenotype")
+
+write.table(results, "mqtl/coloc/mQTL_coloc.tsv", sep="\t", quote=FALSE, row.names=FALSE)
+
+```
+
+## Plot results
+
+```{r}
+
+
+plotAllResultsByPhenotype <- function(phenotype,cases,controls,regions,cartilageMQTLs,results) {
+  
+    results_phenotype <-  results %>% 
+  dplyr::filter(Phenotype==phenotype)
+    
+    if(nrow(results_phenotype)==0) return(NULL)
+
+topProbePlots <-
+  apply(results_phenotype,1,function(x){ 
+    runCOLOC(x["Phenotype"],
+             cases[x["Phenotype"]],
+             controls[x["Phenotype"]],
+             regions[ regions$Chr.pos==x["region.Chr.pos"],],
+             cartilageMQTLs,probe = x["trait2"])})
+
+
+sapply(seq_along(topProbePlots),function(i) {plotColoc(dataset1=topProbePlots[[i]][[1]][[2]],
+                                                          dataset2=topProbePlots[[i]][[1]][[3]],
+                                                          colocResult = results_phenotype[i,],
+                                                          mqtlData = cartilageMQTLs )})
+}
+
+
+plotColoc <- function(dataset1,dataset2,colocResult,mqtlData){
+  
+
+  
+  #get the datasets
+  dataset1 <- bind_cols(dataset1) %>%
+    mutate(logpval=-log10(pvalue)) %>%
+    select(snp,position,logpval)
+  dataset2 <- bind_cols(dataset2) %>%
+    mutate(logpval=-log10(pvalues)) %>%
+        select(snp,position,logpval)
+  
+  #combine the the datasets using the common snps
+  datasets <- list(mQTL=dataset1,GWAS=dataset2)
+  dataset <- bind_rows(datasets,.id = "ids") %>%
+    group_by(snp) %>% 
+    filter(n()>1)
+  
+  #plot the snps and the cpg position
+  #note that the lead snp may not acually be measured in the mqtl data
+  snpgwas <- dataset2[dataset2$snp==paste0("chr",colocResult$region.Chr.pos),]
+  snpgwas$ids="GWAS"
+  snpmqtl <- dataset1[dataset1$snp==paste0("chr",colocResult$region.Chr.pos),]
+  if(nrow(snpmqtl>0)) snpmqtl$ids="mQTL"
+  snp <- bind_rows(snpgwas,snpmqtl)
+  
+  snp$rsid <- colocResult$SNV
+  
+  
+  
+  rsid <- unique(snp$rsid)
+  
+
+  cpg <- data.frame(position=unique(cartilageMQTLs[cartilageMQTLs$CpG==unique(colocResult$trait2),"CpG_position",drop=TRUE]),logpval=-1.5,ids="mQTL")
+ 
+   cpgLabel <-unique(colocResult$trait2)
+
+  
+    g <- ggplot(dataset,aes(position,logpval)) + geom_point(color="grey") +
+      facet_wrap(~ids,ncol = 1) +
+      cowplot::theme_cowplot() +
+      ylab("-log10 pvalue") +
+      xlab("Chr position") +
+      ggtitle(colocResult$Phenotype) +
+      geom_point(data=snp, colour="red") +
+      ggrepel::geom_text_repel(data=snp,aes(label=rsid),force = 10) + 
+      scale_y_continuous(breaks=seq(0,round(max(dataset$logpval)),2)) +
+      geom_point(data=cpg, colour="blue") +
+      ggrepel::geom_label_repel(data=cpg,aes(label=cpgLabel))
+    
+    
+    phenotype = colocResult[,"Phenotype"]
+    
+      print(phenotype)
+    
+    filename <- sprintf("mqtl/coloc/plots/%s_%s_%s.png",rsid,cpgLabel,phenotype)
+    print(filename)
+    save_plot(filename,g,base_height = 8,base_width=8,bg="white")
+    
+  
+}
+
+
+
+sapply(phenotypes,plotAllResultsByPhenotype,cases,controls,regions,cartilageMQTLs,results)
+
+
+
+
+```
+
+## Make publication plot for rs11071366 with ld
+
+```{r}
+#LD of SNPs rs11071366 region obtained with:
+#1000G file from http://fileserve.mrcieu.ac.uk/ld/1kg.v3.tgz
+#plink --bfile EUR -ld-snp rs11071366 -ld-window-kb 500 --ld-window 10000000000  --ld-window-r2 0 --r2 --out rs11071366
+
+results_rs11071366 <- results[ results$Phenotype=="HandOA" & results$SNV=="rs11071366",]
+
+plotData <- runCOLOC("HandOA",
+             cases["HandOA"],
+             controls["HandOA"],
+             regions[ regions$Chr.pos=="15:58334244",],
+             cartilageMQTLs,probe = "cg12031962")
+
+
+LD <- read.table("rs11071366.ld",header=TRUE)
+
+
+dataset1 <- plotData[[1]][[2]]
+dataset2 <- plotData[[1]][[3]]
+
+#get the datasets
+  dataset1 <- bind_cols(dataset1) %>%
+    mutate(logpval=-log10(pvalue)) %>%
+    dplyr::select(snp,position,logpval)
+  dataset2 <- bind_cols(dataset2) %>%
+    mutate(logpval=-log10(pvalues)) %>%
+        dplyr::select(snp,position,logpval)
+  
+  #combine the the datasets using the common snps
+  datasets <- list(mQTL=dataset1,GWAS=dataset2)
+  dataset <- bind_rows(datasets,.id = "ids") %>%
+    group_by(snp) %>% 
+    dplyr::filter(n()>1)
+  
+  dataset <- merge(dataset,LD,by.x="position",by.y="BP_B")
+  
+  
+  
+  #plot the snps and the cpg position
+  #note that the lead snp may not acually be measured in the mqtl data
+  snpgwas <- dataset2[dataset2$snp==paste0("chr",results_rs11071366$region.Chr.pos),]
+  snpgwas$ids="GWAS"
+  snpmqtl <- dataset1[dataset1$snp==paste0("chr",results_rs11071366$region.Chr.pos),]
+  if(nrow(snpmqtl>0)) snpmqtl$ids="mQTL"
+  snp <- bind_rows(snpgwas,snpmqtl)
+  
+  snp$rsid <- results_rs11071366$SNV
+  
+  
+  
+  rsid <- unique(snp$rsid)
+  
+
+  cpg <- data.frame(position=unique(cartilageMQTLs[cartilageMQTLs$CpG==unique(results_rs11071366$trait2),"CpG_position",drop=TRUE]),logpval=-1.5,ids="mQTL")
+ 
+   cpgLabel <-unique(results_rs11071366$trait2)
+
+  blues <- colorRampPalette(c("#64D3FF", "#183B93"))
+    g <- ggplot(dataset,aes(position,logpval)) + geom_point(aes(color=R2)) +
+       scale_color_gradientn(colors=blues(10)) + 
+      facet_wrap(~ids,ncol = 1) +
+      cowplot::theme_cowplot(font_size = 15,rel_small = 0.65) +
+      ylab("-log10 pvalue") +
+      xlab("Chr position") +
+      ggtitle(results_rs11071366$Phenotype) +
+      geom_point(data=snp, colour="red") +
+      ggrepel::geom_text_repel(data=snp,aes(label=rsid),force = 10,nudge_y = 1,min.segment.length = 0) + 
+      scale_y_continuous(breaks=seq(0,round(max(dataset$logpval)),4)) +
+      geom_point(data=cpg, colour="red") +
+      ggrepel::geom_label_repel(data=cpg,aes(label=cpgLabel))
+    
+
+    cowplot::save_plot("mqtl/coloc/rs11071366_coloc_withLD.png",g,base_height = 5,base_width=5,bg="white")
+
+  
+```
+
+## Annotate the coloc results
+
+```{r}
+
+getGenomicRegionType <- function(coords,annotations){
+  
+  #parse the coords 
+  colnames(coords) <- c("chr","start","end")
+  coords$combined <- do.call(paste0, data.frame(coords))
+  
+  #convert the coordinate df to a grange object
+  gr <- GRanges(coords)
+  
+  # Intersect the regions we read in with the annotations
+  dm_annotated = annotate_regions(
+    regions = gr,
+    annotations = annotations,
+    ignore.strand = TRUE,
+    quiet = FALSE)
+
+  #df to parse more easily
+  dm_annotated_df = data.frame(dm_annotated)
+  
+  #collapse the annotate types
+  dm_annotated_df <- dm_annotated_df %>% group_by(seqnames,start,end,combined) %>%
+    summarize(annot.type = paste(unique(annot.type), collapse = ","))
+  
+  #match up in the original order as dplyr summarise rearranges
+  dm_annotated_df <- dm_annotated_df[ match(coords$combined,dm_annotated_df$combined),]
+  dm_annotated_df$annot.type <- gsub("hg19_genes_","",dm_annotated_df$annot.type)
+  
+  return(dm_annotated_df$annot.type)
+  
+}
+
+getNearestProtein <- function(coords){
+  
+  #using hg19 based reference
+  ens <- genes(EnsDb.Hsapiens.v75)
+  
+  #keep protein coding genes only
+  ens <- ens[ens$gene_biotype=="protein_coding",]
+  
+  #convert the coordinates to a GRange - note the chr without "chr"
+  colnames(coords) <- c("chr","start","end")
+  coords$chr <- gsub("chr","",coords$chr)
+  
+  gr <- GRanges(coords)
+  
+  #get the nearest gene
+  nearest <- ens[nearest(gr,ens)]
+  
+  return(nearest$symbol)
+  
+}
+
+
+#get the annotations
+annots <- c("hg19_genes_intergenic","hg19_basicgenes")
+annotations <- build_annotations(genome = 'hg19', annotations = annots)
+
+#get the CpG coordinates
+methLoc <- read.delim("mqtl/methylation_location.for_mqtl.imputed.tsv")
+cpg_coordinates <-  methLoc[ match(results$trait2,methLoc$snp),2:4]
+
+results$CpG_Location <- paste(cpg_coordinates$chr,cpg_coordinates$pos,sep=":")
+
+##get the feature
+results$CpG_Feature <- getGenomicRegionType(cpg_coordinates,annotations)
+
+results$CpG_NearestGene <- getNearestProtein(cpg_coordinates)
+
+
+#read in the mqtl data
+mqtlResults <- read.delim("mqtl/mqtl_analysis.cis_mqtls.genomewide.tsv")
+
+ind <- match(paste(results$SNV,results$trait2,sep="_"),mqtlResults$mqtl)
+
+results$mqtl_nominalpvalue <- mqtlResults[ind ,"FDR"]
+
+
+cartilageMQTLs <- cartilageMQTLs[ cartilageMQTLs$CpG %in% results$trait2,]
+
+cartilageMQTLs <- as.data.frame(cartilageMQTLs)
+cartilageMQTLs$chr_pos <- paste0(cartilageMQTLs$SNP_chr,":",cartilageMQTLs$SNP_pos)
+
+results$mqtl_nominalpvalue <- cartilageMQTLs[ match(paste(results$region.Chr.pos,results$trait2,sep="_"),paste(cartilageMQTLs$chr_pos,cartilageMQTLs$CpG,sep="_")),"pvalue"]
+
+results$mqtl_beta <- cartilageMQTLs[ match(paste(results$region.Chr.pos,results$trait2,sep="_"),paste(cartilageMQTLs$chr_pos,cartilageMQTLs$CpG,sep="_")),"beta"]
+results$mqtl_fdr <- cartilageMQTLs[ match(paste(results$region.Chr.pos,results$trait2,sep="_"),paste(cartilageMQTLs$chr_pos,cartilageMQTLs$CpG,sep="_")),"FDR"]
+
+
+
+#add the alleles
+# results$Alleles <- ifelse(results$EAF < 0.5, paste(results$NEA,results$EA,sep="/"),paste(results$EA,results$NEA,sep="/"))
+
+# #get what the major allele is
+# results$MajorAllele <-  ifelse(results$EAF < 0.5, results$NEA,results$EA)
+
+
+
+#work out if we need to flip the beta to make it with respect to the effect allele.
+#what is the non-ref allele in our data?
+snptable$chrpos <- gsub(":([^:]+:[^:]+)$", "", snptable$id)
+snptable <- snptable[ snptable$chrpos %in% results$region.Chr.pos,]
+snptableSummary <- data.frame(id=snptable$id, 
+                              chrpos=snptable$chrpos,
+                              refAllele = gsub(".*:(.):.*", "\\1",snptable$id),
+                              altAllele = gsub(".*:([^:]+)$", "\\1",snptable$id)
+)
+
+
+
+results <- results[ !is.na(results$mqtl_beta),]
+snptable <- as.data.frame(snptable)
+
+results <- merge(results,snptableSummary,by.x="region.Chr.pos",by.y="chrpos",all.x=TRUE)
+                
+#change the sign the mqtl beta to match the alt allele is not               
+results$mqtl_beta <- ifelse(results$EA != results$altAllele, results$mqtl_beta * -1, results$mqtl_beta)
+
+
+#get the regions
+regions$chr <- gsub("^([0-9]+):.*", "\\1", regions$Chr.pos)
+regions$pos <- gsub("^\\d+:", "", regions$Chr.pos)
+df <- data.frame(chr=regions$chr,pos1=regions$pos,pos2=regions$pos,id=regions$Chr.pos)
+write.table(df, file="mqtl/coloc/regionsForPlink.txt", sep=" ", quote=FALSE, row.names=FALSE,col.names = FALSE)
+
+#plink used to extract the mafs for EUR
+#plink -bfile all_phase3 --keep mqtl/coloc/european1000genomessamples.txt --extract range regionsForPlink.txt --freq --out maf --allow-extra-chr
+
+#from plinkr
+read_plink_frq_file <- function(frq_filename) {
+  table <- stringr::str_split(
+    string = stringr::str_trim(
+      readr::read_lines(
+        file = frq_filename,
+        skip_empty_rows = TRUE
+      )
+    ),
+    pattern = "[:blank:]+",
+    simplify = TRUE
+  )
+  t <- tibble::as_tibble(table[-1, ], .name_repair = "minimal")
+  names(t) <- table[1, ]
+  return(as.data.frame(t))
+}
+  
+mafs <- read_plink_frq_file("mqtl/coloc/maf.txt")
+mafs$chrpos <-gsub("^(\\d+:\\d+).*", "\\1", mafs$SNP)
+colnames(mafs)[3:4] <- c("MinorAllele","MajorAllele")
+
+
+mafs <- mafs[ unique(match(results$region.Chr.pos,mafs$chrpos)),]
+mafs$Alleles <- paste(mafs$MajorAllele,mafs$MinorAllele,sep="/")
+
+results <- merge(results,mafs,by.x="region.Chr.pos",by.y="chrpos")
+
+results$EAimpact <- sign(results$mqtl_beta)
+
+
+
+results <- results[ ,c("Phenotype","SNV","trait2","region.Chr.pos","Alleles","MAF","EA","MajorAllele","Annotation","Nearest.gene","CpG_Location","CpG_Feature","CpG_NearestGene","mqtl_nominalpvalue","mqtl_fdr","mqtl_beta","EAimpact","nsnps","PP.H4.abf")]
+
+colnames(results) <- c("Phenotype","SNV","CpG","SNV_Location","Alleles","EUR_MAF","EffectAllele","MajorAllele","SNV_Feature","SNV_NearestGene","CpG_Location","CpG_Feature","CpG_NearestGene","mQTL_NominalpValue","mQTL_FDR","mQTL_Beta","EA impact on meth","nSNPsTested","Coloc_PP.H4.abf")
+
+
+write.table(results, file="mqtl/coloc/mqtl_coloc_annotated.tsv", sep="\t", quote=FALSE, row.names=FALSE)
+```

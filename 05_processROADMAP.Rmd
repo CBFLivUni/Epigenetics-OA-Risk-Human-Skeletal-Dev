@@ -1,0 +1,482 @@
+---
+title: "ROADMAP"
+author: "Euan McDonnell"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Code
+
+### Libraries
+
+```{r}
+
+library(ggplot2)
+library(RColorBrewer)
+library(stringr)
+library(reticulate)
+
+```
+
+### Define Directories
+
+```{r}
+
+# Define directories
+main_dir <- getwd()
+data_dir <- paste0(main_dir, "/rawdata/")
+res_dir <- paste0(main_dir, "/results/")
+pca_dir <- paste0(main_dir, "/pca/")
+dmr_dir <- paste0(res_dir, "dmr/")
+roadmap_dir <- paste0(dmr_dir, "/ROADMAPstates/")
+de_dir <- paste0(main_dir, "/differential_methylation/")
+util_dir <- paste0(main_dir, "/utilities/")
+log_dir <- paste0(main_dir, "/logs/")
+
+```
+
+### Source R scripts
+
+```{r}
+
+# Source script that sources files
+source("install/source_rscripts.R")
+
+# Source relevant scripts
+SourceExternalScripts(paste0(util_dir, "R/"), "*.R$", ignore.case=FALSE)
+
+```
+
+### Define features
+
+```{r}
+
+# Set features
+features <- c("Tss", "TssFlank", "Enhancer", "Transcribed", "Repressed")
+
+# Check these match
+feature_codes <- list(
+                      c("TssA","TssBiv"),
+                      c("TssAFlnk","BivFlnk"),
+                      c("Enh","EnhG","EnhBiv"),
+                      c("TxWk","Tx","TxFlnk"),
+                      c("Quies","ReprPCWk","ReprPC","Het","ZNF/Rpts")
+); names(feature_codes) <- features
+
+```
+
+### Group 15 ROADMAP states
+
+```{r}
+
+# Read in ROADMAP states bed file
+allFeature_df <- read.table(paste0(roadmap_dir, "E049_15_coreMarks_dense.bed"), sep="\t", header=FALSE, skip=1)
+allFeature_df$V4 <- gsub("[0-9][0-9]*_","",allFeature_df$V4)
+
+# Loop over features
+for (feat in names(feature_codes)) {
+  
+  # Get relevant states
+  featStates <- allFeature_df[which(allFeature_df$V4 %in% feature_codes[[feat]]),]
+  print(paste0("##### WORKING ON :- ",feat, ", total states = ",nrow(featStates)))
+  
+  # Enumerate feature states
+  print(paste0("##### Number of states = ",paste(c(table(featStates$V4)), collapse=", "), " for ",paste(names(table(featStates$V4)), collapse=", ")))
+  
+  # Save
+  write.table(featStates, paste0(roadmap_dir, "E049_15_coreMarks_dense.",feat,"Only.bed"), quote=FALSE, col.names=FALSE, row.names=FALSE, sep="\t")
+  
+  
+}
+
+```
+
+### Read in background data
+
+```{r}
+
+# Loop over ids and read in background feature sets
+feature_df <- do.call("rbind",lapply(features, function(feat) { 
+  
+  # Read in
+  out_df <- read.table(paste0(roadmap_dir, "E049_15_coreMarks_dense.",feat,"Only.bed"), sep="\t", header=FALSE) 
+  
+  # Add feature
+  out_df <- cbind(out_df, FEATURE=feat)
+  
+  # Return
+  return(out_df)
+  
+}))
+
+# Tidy up feature codes
+feature_df$V4 <- gsub(".*_","",feature_df$V4)
+
+# Check for duplicates
+feature_df <- feature_df[!duplicated(feature_df[,c("V1","V2","V3","V4")]),]
+
+# Read in total, unsplit file and check none lost
+if (!nrow(allFeature_df) == nrow(feature_df)) { stop("WARNING!! YOU HAVE LOST SOME SITES WHEN SPLITTING INTO STATES!!!")}
+
+```
+
+### Overlap DMRs 
+
+#### With ROADMAP features
+
+Requires Bedtools, must be run on bash from the main project directory
+
+```
+
+# Include a check to see if these output files exist else error.
+bash scripts/overlap_allROADMAP.sh  $PWD "$PWD/results/dmr/" up True
+bash scripts/overlap_allROADMAP.sh  $PWD "$PWD/results/dmr/" down True
+
+```
+
+### Overlap DMRs
+
+#### With ATAC regions
+
+Running these aren't essential for the rest of this code.
+
+```
+
+bash scripts/overlap_allATAC.sh $PWD $PWD/results/dmr/ up True
+bash scripts/overlap_allATAC.sh $PWD $PWD/results/dmr/ down True
+
+```
+
+### Read in overlap data
+
+#### DMR
+
+Note that some of the sex DMRs don't overlap with states of some features, so will error as no lines. This is fine.
+
+Note that some DMRs overlap with multiple states, so there will be duplicates. This is fine.
+
+```{r}
+
+# Read in
+## Stage
+upStageDMR_ovlp_df <- ReadInOverlapDMRs(features, dmrSet="up_dDMR", in_dir=dmr_dir)
+dnStageDMR_ovlp_df <- ReadInOverlapDMRs(features, dmrSet="down_dDMR", in_dir=dmr_dir)
+allStageDMR_ovlp_df <- rbind(upStageDMR_ovlp_df, dnStageDMR_ovlp_df)
+allNSStageDMR_ovlp_df <- ReadInOverlapDMRs(features, dmrSet="allNonSig_dDMR", in_dir=dmr_dir)
+
+## Sex
+upSexDMR_ovlp_df <- ReadInOverlapDMRs(features, dmrSet="up_sDMR", in_dir=dmr_dir)
+dnSexDMR_ovlp_df <- ReadInOverlapDMRs(features, dmrSet="down_sDMR", in_dir=dmr_dir)
+allSexDMR_ovlp_df <- rbind(upSexDMR_ovlp_df, dnSexDMR_ovlp_df)
+allNSSexDMR_ovlp_df <- ReadInOverlapDMRs(features, dmrSet="allNonSig_sDMR", in_dir=dmr_dir)
+
+```
+
+### Check feature codes are consistent with paper
+
+"The active states (associated with expressed genes) consist of active transcription start site (TSS) proximal promoter states (TssA, TssAFlnk), a transcribed state at the 5′ and 3′ end of genes showing both promoter and enhancer signatures (TxFlnk), actively transcribed states (Tx, TxWk), enhancer states (Enh, EnhG), and a state associated with zinc finger protein genes (ZNF/Rpts). The inactive states consist of constitutive heterochromatin (Het), bivalent regulatory states (TssBiv, BivFlnk, EnhBiv), repressed Polycomb states (ReprPC, ReprPCWk), and a quiescent state (Quies), which covered on average 68% of each reference epigenome"
+
+This paper: https://www.nature.com/articles/s41598-020-58093-5#Sec4
+
+```{r}
+
+# Loop over and check feature codes match the overall features
+for (feat in names(feature_codes)) {
+  
+  # If feature codes don't match the overall features
+  print(feat)
+  if (!all(sort(feature_codes[[feat]]) == sort(unique(feature_df[feature_df$FEATURE == feat,]$V4)))) {
+    
+    stop("WARNING - MISASSIGNED FEATURE CODES, CHECK YOUR GREP!!!!")
+    
+  }
+  
+}
+
+```
+
+### Add feature groupings
+
+```{r}
+
+allFeature_df$V4 <- gsub(".*_","",allFeature_df$V4)
+allFeature_df["FEATURE"] <- ""
+for (feat in features) {
+  
+  allFeature_df[which(allFeature_df$V4 %in% feature_codes[[feat]]),]["FEATURE"] <- feat
+  
+}
+
+```
+
+### Calculate frequencies
+
+```{r}
+
+# Calculate frequencies
+## Background
+backFreq <- CalcFreqFeatures(feature_df, set="Genome")
+backFreqCheck <- CalcFreqFeatures(allFeature_df, set="Genome")
+
+## Stage
+allNSStageDMRFreq <- CalcFreqFeatures(allNSStageDMR_ovlp_df, set="All (Detected) DMRs")
+allStageDMRFreq <- CalcFreqFeatures(rbind(upStageDMR_ovlp_df, dnStageDMR_ovlp_df), set="All (Sig) DMRs")
+upStageDMRFreq  <- CalcFreqFeatures(upStageDMR_ovlp_df, set="Up (Sig) DMRs")
+dnStageDMRFreq  <- CalcFreqFeatures(dnStageDMR_ovlp_df, set="Down (Sig) DMRs")
+
+## Sex
+allNSSexDMRFreq <- CalcFreqFeatures(allNSSexDMR_ovlp_df, set="All (Detected) DMRs")
+allSexDMRFreq <- CalcFreqFeatures(rbind(upSexDMR_ovlp_df, dnSexDMR_ovlp_df), set="All (Sig) DMRs")
+upSexDMRFreq  <- CalcFreqFeatures(upSexDMR_ovlp_df, set="Up (Sig) DMRs")
+dnSexDMRFreq  <- CalcFreqFeatures(dnSexDMR_ovlp_df, set="Down (Sig) DMRs")
+
+# Calculate cumulative widths
+## Background
+backWidthFreq <- CalcFeatureWidths(feature_df, set="Genome")
+backWidthFreqCheck <- CalcFeatureWidths(allFeature_df, set="Genome")
+
+## Stage
+allNSWidthStageDMRFreq <- CalcFeatureWidths(allNSStageDMR_ovlp_df, set="All (Detected) DMRs")
+allWidthStageDMRFreq <- CalcFeatureWidths(rbind(upStageDMR_ovlp_df, dnStageDMR_ovlp_df), set="All (Sig) DMRs")
+upWidthStageDMRFreq  <- CalcFeatureWidths(upStageDMR_ovlp_df, set="Up (Sig) DMRs")
+dnWidthStageDMRFreq  <- CalcFeatureWidths(dnStageDMR_ovlp_df, set="Down (Sig) DMRs")
+
+## Sex
+allNSWidthSexDMRFreq <- CalcFeatureWidths(allNSSexDMR_ovlp_df, set="All (Detected) DMRs")
+allWidthSexDMRFreq <- CalcFeatureWidths(rbind(upSexDMR_ovlp_df, dnSexDMR_ovlp_df), set="All (Sig) DMRs")
+upWidthSexDMRFreq  <- CalcFeatureWidths(upSexDMR_ovlp_df, set="Up (Sig) DMRs")
+dnWidthSexDMRFreq  <- CalcFeatureWidths(dnSexDMR_ovlp_df, set="Down (Sig) DMRs")
+
+```
+
+### Check background frequency counts
+
+```{r}
+
+# Enumerate combined feature counts
+allFeatureCounts <- c(table(allFeature_df$V4))
+
+for (feat in features) { 
+  
+  # Check if total count in background matches sum of 15 state-wise counts
+  print(feat)
+  countMatch <- sum(allFeatureCounts[feature_codes[[feat]]]) == backFreq[backFreq$Feature == feat,]$Count 
+  
+  # If not the case, stop
+  if (!countMatch) { stop("FREQUENCY OF YOUR BROAD STATE COUNTs IS NOT THE SUM OF THEIR RESPECTIVE 15 STATE COUNTS") }
+  
+}
+
+```
+
+### Plot
+
+#### Prepare
+
+```{r}
+
+# Combine
+freq_stageDMRs <- rbind(backFreq,
+                        allNSStageDMRFreq,
+                        allStageDMRFreq,
+                        upStageDMRFreq,
+                        dnStageDMRFreq)
+freq_sexDMRs   <- rbind(backFreq,
+                        allNSWidthSexDMRFreq,
+                        allSexDMRFreq,
+                        upSexDMRFreq,
+                        dnSexDMRFreq)
+freq_stageWidthDMRs <- rbind(backWidthFreq,
+                             allNSWidthStageDMRFreq,
+                             allWidthStageDMRFreq,
+                             upWidthStageDMRFreq,
+                             dnWidthStageDMRFreq)
+freq_sexWidthDMRs   <- rbind(backWidthFreq,
+                             allNSWidthSexDMRFreq,
+                             allWidthSexDMRFreq,
+                             upWidthSexDMRFreq,
+                             dnWidthSexDMRFreq)
+
+# Define colours
+feat_colors <- c("#FF0100", "#DD7095", "#FED800", "#008D00", "#BFBFBF")
+names(feat_colors) <- str_to_title(gsub("tss","TSS",features))
+
+# Tidy up names
+freq_stageDMRs$Feature <- str_to_title(gsub("Tss","TSS",freq_stageDMRs$Feature))
+freq_sexDMRs$Feature <- str_to_title(gsub("Tss","TSS",freq_sexDMRs$Feature))
+freq_stageWidthDMRs$Feature <- str_to_title(gsub("Tss","TSS",freq_stageWidthDMRs$Feature))
+freq_sexWidthDMRs$Feature <- str_to_title(gsub("Tss","TSS",freq_sexWidthDMRs$Feature))
+
+```
+
+#### Stat test
+
+##### Chi-squared (overall)
+
+Chi squared. This test for any deviation over the whole distributions of test/background. 
+
+Error on Sex "Warning: Chi-squared approximation may be incorrect". 
+
+```{r}
+
+# Loop over sets and test
+sets2Test <- c("All (Sig) DMRs", "Up (Sig) DMRs", "Down (Sig) DMRs")
+freq_stageDMRs$Set <- as.character(freq_stageDMRs$Set)
+freq_stageWidthDMRs$Set <- as.character(freq_stageWidthDMRs$Set)
+
+## Count
+stageChiSq <- do.call("rbind",lapply(sets2Test, function(feature) { 
+  
+  # 
+  print(feature)
+  
+  # Run test and return
+  return(TestChiSqEnrichment(freq_stageDMRs, testFeature=feature, backFeature="Genome")) 
+  
+}))
+
+## Width
+stageWidthChiSq <- do.call("rbind",lapply(sets2Test, function(feature) { 
+  
+  # 
+  print(feature)
+  
+  # Run test and return
+  return(TestChiSqEnrichment(freq_stageWidthDMRs, testFeature=feature, backFeature="Genome")) 
+  
+}))
+
+# Save
+colnames(stageChiSq) <- gsub("p[.]value","raw p.value", colnames(stageChiSq))
+colnames(stageWidthChiSq) <- gsub("p[.]value","raw p.value", colnames(stageWidthChiSq))
+write.table(stageChiSq, paste0(dmr_dir, "stageDMROverlap_ROADMAPfeatures_featureCounts_chiSqTestResults.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(stageWidthChiSq, paste0(dmr_dir, "stageDMROverlap_ROADMAPfeatures_featuteWidths_chiSqTestResults.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+```
+
+##### Fisher's exact (per feature)
+
+This tests for individual category-wise overlaps.
+
+```{r}
+
+# Stage 
+## Feature counts
+allStageFish <- FeatureWiseFishers(inDF=freq_stageDMRs,testFeature="All (Sig) DMRs", backFeature="All (Detected) DMRs")
+upStageFish <- FeatureWiseFishers(inDF=freq_stageDMRs,testFeature="Up (Sig) DMRs", backFeature="All (Detected) DMRs")
+dnStageFish <- FeatureWiseFishers(inDF=freq_stageDMRs,testFeature="Down (Sig) DMRs", backFeature="All (Detected) DMRs")
+
+# Get to kbs
+freq_stageWidthDMRs_byKb <- freq_stageWidthDMRs
+freq_stageWidthDMRs_byKb["Count"] <- round( freq_stageWidthDMRs_byKb$Count / 1000 )
+
+## Feature widths
+allStageWidthFish <- FeatureWiseFishers(inDF=freq_stageWidthDMRs_byKb,testFeature="All (Sig) DMRs", backFeature="All (Detected) DMRs", maxItems=maxCounts)
+upStageWidthFish <- FeatureWiseFishers(inDF=freq_stageWidthDMRs_byKb,testFeature="Up (Sig) DMRs", backFeature="All (Detected) DMRs", maxItems=maxCounts)
+dnStageWidthFish <- FeatureWiseFishers(inDF=freq_stageWidthDMRs_byKb,testFeature="Down (Sig) DMRs", backFeature="All (Detected) DMRs", maxItems=maxCounts)
+
+# Sex 
+## Feature counts
+allSexFish <- FeatureWiseFishers(inDF=freq_sexDMRs,testFeature="All (Sig) DMRs", backFeature="All (Detected) DMRs")
+upSexFish <- FeatureWiseFishers(inDF=freq_sexDMRs,testFeature="Up (Sig) DMRs", backFeature="All (Detected) DMRs")
+dnSexFish <- FeatureWiseFishers(inDF=freq_sexDMRs,testFeature="Down (Sig) DMRs", backFeature="All (Detected) DMRs")
+
+# Get to kbs
+freq_sexWidthDMRs_byKb <- freq_sexWidthDMRs
+freq_sexWidthDMRs_byKb["Count"] <- round( freq_sexWidthDMRs_byKb$Count / 1000 )
+
+## Feature widths
+allSexWidthFish <- FeatureWiseFishers(inDF=freq_sexWidthDMRs_byKb,testFeature="All (Sig) DMRs", backFeature="All (Detected) DMRs", maxItems=maxCounts)
+upSexWidthFish <- FeatureWiseFishers(inDF=freq_sexWidthDMRs_byKb,testFeature="Up (Sig) DMRs", backFeature="All (Detected) DMRs", maxItems=maxCounts)
+dnSexWidthFish <- FeatureWiseFishers(inDF=freq_sexWidthDMRs_byKb,testFeature="Down (Sig) DMRs", backFeature="All (Detected) DMRs", maxItems=maxCounts)
+
+# Combine
+StageFish <- rbind(allStageFish, upStageFish, dnStageFish)
+StageWidthFish <- rbind(allStageWidthFish, upStageWidthFish, dnStageWidthFish)
+SexFish <- rbind(allSexFish, upSexFish, dnSexFish)
+SexWidthFish <- rbind(allSexWidthFish, upSexWidthFish, dnSexWidthFish)
+
+# Save
+## Stage
+write.table(stageFish, paste0(dmr_dir, "stageDMROverlap_ROADMAPfeatures_featureCounts_fishExactTestResults.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(stageWidthFish, paste0(dmr_dir, "stageDMROverlap_ROADMAPfeatures_featureWidthsInKb_fishExactTestResults.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(sexFish, paste0(dmr_dir, "sexDMROverlap_ROADMAPfeatures_featureCounts_fishExactTestResults.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(sexWidthFish, paste0(dmr_dir, "sexDMROverlap_ROADMAPfeatures_featureWidthsInKb_fishExactTestResults.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+# Check significant (with bonferonni adjustment)
+stageFish[stageFish$`raw p.value` < (0.05 / nrow(stageFish)),]
+
+```
+
+#### Plot
+
+```{r}
+
+# Properly order
+freq_stageDMRs$Set <- factor(freq_stageDMRs$Set, levels=rev(c("All (Detected) DMRs", "All (Sig) DMRs", "Up (Sig) DMRs", "Down (Sig) DMRs", "Genome")))
+freq_sexDMRs$Set <- factor(freq_sexDMRs$Set, levels=rev(c("All (Detected) DMRs", "All (Sig) DMRs", "Up (Sig) DMRs", "Down (Sig) DMRs", "Genome")))
+freq_stageWidthDMRs$Set <- factor(freq_stageWidthDMRs$Set, levels=rev(c("All (Detected) DMRs", "All (Sig) DMRs", "Up (Sig) DMRs", "Down (Sig) DMRs", "Genome")))
+freq_sexWidthDMRs$Set <- factor(freq_sexWidthDMRs$Set, levels=rev(c("All (Detected) DMRs", "All (Sig) DMRs", "Up (Sig) DMRs", "Down (Sig) DMRs", "Genome")))
+
+# Plot
+dDMR_plt <- ggplot(freq_stageDMRs, aes(y=Set, x=Prop, fill=Feature)) + 
+                   geom_bar(stat="identity", color="black") +
+                   scale_fill_manual(values=feat_colors) +
+                   ylab("") + xlab("Proportion of States") +
+                   ggtitle("Developmental Stage DMRs") +
+                   theme_minimal(base_size=20) + theme(plot.title=element_text(size=36),
+                                                       axis.title=element_text(size=32),
+                                                       legend.text=element_text(size=16),
+                                                       panel.grid.major.y = element_blank() ,
+                                                       panel.grid.major.x = element_line( size=.1, color="darkgrey" ) )
+sDMR_plt <- ggplot(freq_sexDMRs, aes(y=Set, x=Prop, fill=Feature)) + 
+                   geom_bar(stat="identity", color="black") +
+                   scale_fill_manual(values=feat_colors) +
+                   ylab("") + xlab("Proportion of States") +
+                   ggtitle("Sex DMRs") +
+                   theme_minimal(base_size=20) + theme(plot.title=element_text(size=36),
+                                                       axis.title=element_text(size=32),
+                                                       legend.text=element_text(size=16),
+                                                       panel.grid.major.y = element_blank() ,
+                                                       panel.grid.major.x = element_line( size=.1, color="darkgrey" ) )
+
+# Save
+ggsave(paste0(dmr_dir, "stageDMROverlap_ROADMAPfeatures_freqBarPlot.png"), dDMR_plt, width=4000, height=2000, units="px", device="png",bg="white")
+ggsave(paste0(dmr_dir, "stageDMROverlap_ROADMAPfeatures_freqBarPlot.pdf"), dDMR_plt, width=4000, height=2000, units="px", device="pdf",bg="white")
+
+ggsave(paste0(dmr_dir, "sexDMROverlap_ROADMAPfeatures_freqBarPlot.png"), sDMR_plt, width=4000, height=2000, units="px", device="png",bg="white")
+ggsave(paste0(dmr_dir, "sexDMROverlap_ROADMAPfeatures_freqBarPlot.pdf"), sDMR_plt, width=4000, height=2000, units="px", device="pdf",bg="white")
+
+
+# Plot
+dDMR_plt <- ggplot(freq_stageWidthDMRs, aes(y=Set, x=Prop, fill=Feature)) + 
+                   geom_bar(stat="identity", color="black") +
+                   scale_fill_manual(values=feat_colors) +
+                   ylab("") + xlab("Proportion of Cumulative State Region Widths") +
+                   ggtitle("Developmental Stage DMRs") +
+                   theme_minimal(base_size=20) + theme(plot.title=element_text(size=36),
+                                                       axis.title=element_text(size=24),
+                                                       legend.text=element_text(size=16),
+                                                       panel.grid.major.y = element_blank() ,
+                                                       panel.grid.major.x = element_line( size=.1, color="darkgrey" ) )
+sDMR_plt <- ggplot(freq_sexWidthDMRs, aes(y=Set, x=Prop, fill=Feature)) + 
+                   geom_bar(stat="identity", color="black") +
+                   scale_fill_manual(values=feat_colors) +
+                   ylab("") + xlab("Proportion of Cumulative State Region Widths") +
+                   ggtitle("Sex DMRs") +
+                   theme_minimal(base_size=20) + theme(plot.title=element_text(size=36),
+                                                       axis.title=element_text(size=24),
+                                                       legend.text=element_text(size=16),
+                                                       panel.grid.major.y = element_blank() ,
+                                                       panel.grid.major.x = element_line( size=.1, color="darkgrey" ) )
+
+# Save
+ggsave(paste0(dmr_dir, "stageDMROverlap_ROADMAPfeatures_proportionalCumulativeWidthBarPlot.png"), dDMR_plt, width=4000, height=2000, units="px", device="png",bg="white")
+ggsave(paste0(dmr_dir, "stageDMROverlap_ROADMAPfeatures_proportionalCumulativeWidthBarPlot.pdf"), dDMR_plt, width=4000, height=2000, units="px", device="pdf",bg="white")
+
+ggsave(paste0(dmr_dir, "sexDMROverlap_ROADMAPfeatures_proportionalCumulativeWidthBarPlot.png"), sDMR_plt, width=4000, height=2000, units="px", device="png",bg = "white")
+ggsave(paste0(dmr_dir, "sexDMROverlap_ROADMAPfeatures_proportionalCumulativeWidthBarPlot.pdf"), sDMR_plt, width=4000, height=2000, units="px", device="pdf",bg="white")
+
+```
+
+

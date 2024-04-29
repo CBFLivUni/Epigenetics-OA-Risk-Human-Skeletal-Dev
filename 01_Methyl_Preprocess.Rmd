@@ -1,0 +1,601 @@
+---
+title: "Methylation - Preprocessing"
+format: html
+---
+
+Workflow mostly based on: https://master.bioconductor.org/packages/release/workflows/vignettes/methylationArrayAnalysis/inst/doc/methylationArrayAnalysis.html And: https://www.cell.com/ajhg/pdf/S0002-9297(22)00216-6.pdf:
+
+## Notes
+
+### DNA Methylation
+
+Bisulfite conversion: Treatment of unmethylated CpG converts C --\> T, which leaving mC as C.
+
+### Methylation Arrays
+
+Illumina array Methods: \* One-colour: Makes use of 2 bead types (one for unmethylated (U), one for methylated (M)). Incoorporate the same labelled nt (AGCT) of same colour. Proportion of methylation is determined by the relative intensities of these two in the same colour. \* Two-colour: Single bead type, but different based extension (G/A depending on methylatd or unmethylated (C/T)). Methylation determined by comparing two colours.
+
+Both calculate 2 quantities; $U$ (unmethylated intensity) and $M$ (methylated intensity). Methylation levels often quantified as $\beta$ or $M$:
+
+$$\beta = \frac{M}{M + U}$$
+
+$$M = \log_2{\frac{M}{U}}$$
+
+$\beta$ and $M$ are related via a logit transformation. $\beta$ values favoured for describing methylation level of a locus for graphical presentation as % methylation is interpretable. $M$ are more appropriate for statistical testing due to their distributional properties.
+
+Can also add a small offset value $\alpha$ to the denominator to limit division by small values (default is $\alpha$ = 100). Can also add other offsets to numerator and denominator in when calculating $M$ but *minifi* doesn't do this.
+
+## Analysis
+
+Data are Illumina MethylationEPIC BeadChip microarrays, measuring \>850K methylation CpGs.
+
+### Libraries
+
+```{r}
+
+# Plotting and graphics
+library(ggplot2)
+library(RColorBrewer)
+library(scales)
+library(colorspace)
+
+# Data QC 
+library(wateRmelon)
+library(DNAmArray)
+library(minfi)
+library(maxprobes)
+
+# Annotation
+library(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+# Programming, parsing and data wrangling
+library(mgsub)
+library(GenomicFeatures)
+#library(doSNOW) # parallel processes on Windows
+library(foreach)
+library(RcppEigen) # For faster lm 
+
+# Statistics and analyses
+library(limma)
+library(factoextra)
+library(sva)
+library(pvca)
+library(dmrff)
+library(DMRcate)
+
+# Gene ontology
+library(clusterProfiler)
+#library(methylGSA)
+
+```
+
+### Parameters
+
+```{r}
+
+#set the treat log2 treshold
+trt_log2fc_thr <- 0.1
+
+# If we want to drop the mismatched sex
+dropMismatchedSex <- TRUE
+
+```
+
+### Directories
+
+```{r}
+
+# Defined main dir
+scripts_dir <- getwd()
+main_dir <- "methylation/"
+data_dir <- "rawdata/"
+res_dir <- "results/"
+pca_dir <- "pca/"
+dmr_dir <- "dmr/"
+de_dir <- "differential_methylation/"
+util_dir <- "utilities/"
+
+# Make directories
+for (dir in c(data_dir, res_dir, pca_dir, dmr_dir, de_dir)) { dir.create(dir, recursive=TRUE)}
+
+```
+
+### Read in the data
+
+#### Metadata
+
+For BeadArray platforms, Illumina methylation data is usually in IDAT (Intensity Data) files. Stores summary intensities for each probe on the array.
+
+Probes for CpG islands, shores and shelves, the 5′UTR, 3′UTR and bodies of RefSeq genes, FANTOM5 promoters and enahancers and the MHC region
+
+```{r}
+
+# Read in array metadata
+array_metadata <- read.metharray.sheet(paste0(data_dir, "EPIC_Idats"), pattern="E181906_SampleSheet_SR_EPIC_300323")
+
+# Read in sample metadata
+sample_metadata <- readxl::read_xlsx(paste0(data_dir,"sample_metadata.xlsx"))
+
+# Merge data together (removing NA columns)
+metadata <- merge(array_metadata[,unique(sapply(array_metadata, function(col) !is.na(col)))], sample_metadata, by.x="Sample_Name", by.y="embryo_id")
+
+# Sort batches
+metadata["Batch"] <- mgsub(metadata$Basename,c(".*[/]","_R.*"),c("",""))
+
+# Add array row metadata
+metadata["ARRAY_ROW"] <- gsub("[0-9]*","",metadata$plate_well)
+
+```
+
+### Add BMI and gestation groups
+
+```{r}
+
+# Group BMI
+metadata["BMI_GROUP"] <- "Underweight"
+metadata[metadata$mat_bmi >= 18.5 & metadata$mat_bmi < 24.9,]["BMI_GROUP"] <- "Normal"
+metadata[metadata$mat_bmi >= 25 & metadata$mat_bmi < 29.9,]["BMI_GROUP"] <- "Overweight"
+metadata[metadata$mat_bmi >= 30 & metadata$mat_bmi < 34.9,]["BMI_GROUP"] <- "Obese"
+metadata[metadata$mat_bmi >= 35,]["BMI_GROUP"] <- "Extremely Obese"
+
+# Binarise BMI
+metadata["BMI_BINARY"] <- "High"
+metadata[metadata$mat_bmi < 25,]["BMI_BINARY"] <- "Low"
+
+# Binarise stage
+metadata["TRIMESTER"] <- ""
+metadata[metadata$stage_weeks <= 12,]["TRIMESTER"] <- "First"
+metadata[metadata$stage_weeks > 12,]["TRIMESTER"] <- "Second"
+table(metadata$TRIMESTER) # Check
+
+```
+
+#### Expression data
+
+```{r}
+
+# Read in data
+rgSet <- read.metharray(metadata$Basename, extended=TRUE)
+
+# give the samples descriptive names
+sampleNames(rgSet) <- metadata$Sample_Name
+rgSet
+
+```
+
+#### Annotation data
+
+```{r}
+
+# Check annoation
+rgSet@annotation
+
+# Load data
+data(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+annotdata <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+
+```
+
+### QC
+
+#### Check bisulfite conversion
+
+```{r}
+
+# Calculate sample-wise % bisulfite conversion
+perc_bsconv <- bscon(rgSet)
+sort(perc_bsconv)
+
+```
+
+#### Check sex
+
+```{r}
+
+# Map to genome
+GMsetEx <- mapToGenome(rgSet)
+
+# Predict sex and compare it to metadata
+sex_predict <- minfi::getSex(GMsetEx, cutoff = -2) 
+pred_sex_vector <- sex_predict$predictedSex; names(pred_sex_vector) <- rownames(sex_predict)
+
+# Get male/female labels and compare
+rownames(metadata) <- metadata$Sample_Name
+metadata <- metadata[as.character(sampleNames(GMsetEx)),]
+lab_sex_vector <- ifelse(grepl("female",metadata$sex), "F","M")
+names(lab_sex_vector) <- metadata$Sample_Name
+
+# Compare 
+sort(pred_sex_vector)
+sort(lab_sex_vector)
+pred_sex_vector == lab_sex_vector
+
+# Add to metadata
+metadata["SEX_MATCH"] <- NA
+metadata[names(pred_sex_vector == lab_sex_vector),]["SEX_MATCH"] <- unname(ifelse(pred_sex_vector == lab_sex_vector, "SAME", "DIFFERENT"))
+
+```
+
+### Define colour palettes
+
+```{r}
+
+# Categorial
+sex_pal <- c("green", "mediumpurple")
+array_pal <- hue_pal()(length(unique(metadata$Array)))
+well_pal <- brewer.pal(length(unique(metadata$ARRAY_ROW)),"Dark2")
+batch_pal <- brewer.pal(length(unique(metadata$Batch)),"Set1"); names(batch_pal) <- unique(metadata$Batch) 
+
+# Define BMI group colours
+bmi_cols <- npreg::number2color(c(1,2,3,4,5), c("yellow","darkred"), equidistant = FALSE, xmin=1, xmax=5)
+names(bmi_cols) <- c("Underweight","Normal","Overweight","Obese","Extremely Obese")
+
+# Continuous
+weeks.col_ramp <- colour_ramp(c("white","darkgreen"), na.color="grey", alpha=TRUE)
+mat_age.col_ramp <- colour_ramp(c("white","blue"), na.color="grey", alpha=TRUE)
+bmi.col_ramp <- colour_ramp(c("white","darkorange"), na.color="grey", alpha=TRUE)
+
+```
+
+#### Investigate non matching sample
+
+```{r}
+
+# Investigate sex matching samples
+nonmatch_sample <- metadata[metadata$SEX_MATCH == "DIFFERENT",]$Sample_Name
+nonmatch.rgSet <- rgSet[, sampleNames(rgSet) == nonmatch_sample]
+
+# Get Y chromosome
+chry.rgSet <- rgSet[which(featureNames(rgSet) %in% annotdata[which(annotdata$chr %in% c("chrY")),]$AddressA),]
+
+# Add to metadata
+metadata["CHRY_MEAN"] <- colMeans(getBeta(chry.rgSet)[,as.character(metadata$Sample_Name)], na.rm=T)
+
+# Plot
+ggplot(metadata, aes(x=reorder(Sample_Name, CHRY_MEAN), y=CHRY_MEAN, fill=sex)) + 
+  geom_bar(stat="identity") + 
+  scale_fill_manual(values=sex_pal) +
+  theme_bw(base_size=16) + theme(axis.text.x=element_text(angle=90, hjust=1, vjust=0.5, size=6),
+                                 legend.position="top")
+
+ggplot(metadata, aes(x=reorder(Sample_Name, CHRY_MEAN), y=CHRY_MEAN, fill=SEX_MATCH)) + 
+  geom_bar(stat="identity", color="black") + 
+  scale_fill_manual(values=c("black","white")) +
+  theme_bw(base_size=16) + theme(axis.text.x=element_text(angle=90, hjust=1, vjust=0.5, size=6),
+                                 legend.position="top")
+
+```
+ 
+#### Drop mismatched sex
+
+```{r}
+
+# If we want to drop it
+if (dropMismatchedSex) { 
+
+  # Drop from metadata and expression sete
+  metadata <- metadata[metadata$SEX_MATCH != "DIFFERENT",]
+  rgSet <- rgSet[,as.character(metadata$Sample_Name)]
+  
+}
+
+```
+
+#### Detection p-value based methods
+
+Compares total signal for each CpG ($M + U$) to the background signal, which is estimated from control probes. We want very small p-values, usually filter $p<0.01$.
+
+```{r}
+
+# Detection p-values
+detP <- detectionP(rgSet)
+
+```
+
+### Investigate N. detection p\>0.01 between sexes
+
+```{r}
+
+# Calculate mean detection p-values manually
+female.detP <- detectionP(rgSet[,sampleNames(rgSet) %in% metadata[metadata$sex == "female",]$Sample_Name])
+mean(colMeans(female.detP))
+male.detP <- detectionP(rgSet[,sampleNames(rgSet) %in% metadata[metadata$sex == "male",]$Sample_Name])
+mean(colMeans(male.detP))
+
+# Set probes with p >= 0.01 to NA
+filt.detP <- detP
+filt.detP[filt.detP >= 0.01] <- NA
+
+# Calc number of probes above significance
+filt.detP <- filt.detP[,as.character(metadata$Sample_Name)]
+metadata["N_NA"] <- unlist(lapply(colnames(filt.detP), function(sample_id) {
+  
+  length(filt.detP[,sample_id][is.na(filt.detP[,sample_id])])
+  
+}))
+
+# Boxplot of N. NAs
+ggplot(metadata, aes(x=sex, y=N_NA, fill=sex)) + 
+  geom_boxplot() + 
+  scale_fill_manual(values=sex_pal) +
+  xlab("Gender") + ylab("Number of Probes Under\nDetection Threshold (p<0.01)") +
+  theme_bw()
+
+# Histogram of male/female NA
+hist(unlist(-log10(male.detP)))
+hist(unlist(-log10(female.detP)))
+
+```
+
+### Normalisation
+
+The package *minfi* provides 2 normalisation approaches: \* `preprocessFunnorm()` - most appropriate for data-sets with global methylation differences (ie cancer/normal, different tissues). \* `preprocessQuantile()` - most suited for when we do not expect global differences between samples.
+
+The package *quantro* includes data-driven tests to check assumptions of quantile normalisation (), see: https://genomebiology.biomedcentral.com/articles/10.1186/s13059-015-0679-0
+
+#### Normalise
+
+```{r}
+
+# Check chromosomes
+table(annotdata[which(annotdata$AddressA %in% featureNames(rgSet)),]$chr)
+
+# normalize the data; this results in a GenomicRatioSet object
+qnt.mSetSq <- preprocessQuantile(rgSet[rowSums(getBeta(rgSet), na.rm=TRUE) > 0 & complete.cases(getBeta(rgSet)) & !is.na(rowSums(getBeta(rgSet))),]) 
+fun.mSetSq <- preprocessFunnorm(rgSet[rowSums(getBeta(rgSet), na.rm=TRUE) > 0 & complete.cases(getBeta(rgSet)) & !is.na(rowSums(getBeta(rgSet))),]) 
+
+# create a MethylSet object from the raw data for plotting
+mSetRaw <- preprocessRaw(rgSet[rowSums(getBeta(rgSet), na.rm=TRUE) > 0 & complete.cases(getBeta(rgSet)) & !is.na(rowSums(getBeta(rgSet))),])
+
+```
+
+### Exclude sex chrms and try again
+
+"However, due to X chromosome inactivation in females, large differences in methylation levels of X chromosomes can be observed between males and females \[29\]. Recent research suggests that normalising methylation data with the sex chromosomes introduces a large technical bias to many autosomal CpGs \[30\]. This technical bias has been reported to result in many autosomal CpG sites being falsely associated with sex even when male and female samples are normalised independently of each other, a method employed by some studies in the field. Moreover, it also leads to many autosomal CpGs being incorrectly identified to be more methylated in male samples compared to female samples" - https://clinicalepigeneticsjournal.biomedcentral.com/articles/10.1186/s13148-022-01279-7
+
+```{r}
+
+# Get non X/Y probes
+nonsex_probes <- rownames(annotdata[!annotdata$chr %in% c("chrX","chrY"),])
+
+# Calc mean detaction P-values and order by decreasing P
+metadata["NO_SEXCHRM_MEAN_DETP"] <- colMeans(detP[nonsex_probes,])[as.character(metadata$Sample_Name)]
+metadata <- metadata[order(metadata$NO_SEXCHRM_MEAN_DETP, decreasing=TRUE),]
+
+## By sex
+# barplot(metadata$NO_SEXCHRM_MEAN_DETP, col=sex_pal[factor(metadata$sex)], las=2, 
+#         cex.names=0.8, ylab="Mean detection p-values", main="By Sex")
+# abline(h=0.05,col="red")
+# legend("topright", legend=levels(factor(metadata$sex)), fill=sex_pal,
+#        bg="white")
+
+# Remove sex chromosome probes from now on
+mSetRaw <- mSetRaw[which(featureNames(mSetRaw) %in% rownames(annotdata[nonsex_probes,])),]
+qnt.mSetSq <- qnt.mSetSq[which(featureNames(qnt.mSetSq) %in% rownames(annotdata[nonsex_probes,])),]
+fun.mSetSq <- fun.mSetSq[which(featureNames(fun.mSetSq) %in% rownames(annotdata[nonsex_probes,])),]
+
+# Check chromosomes
+table(annotdata[which(rownames(annotdata) %in% featureNames(mSetRaw)),]$chr)
+
+```
+
+### Investigate sex differences in detection p-values
+
+```{r}
+
+# Calculate mean detection p-values manually
+female.detP <- detectionP(rgSet[,sampleNames(rgSet) %in% metadata[metadata$sex == "female",]$Sample_Name])
+mean(colMeans(female.detP))
+male.detP <- detectionP(rgSet[,sampleNames(rgSet) %in% metadata[metadata$sex == "male",]$Sample_Name])
+mean(colMeans(male.detP))
+
+# Set probes with p >= 0.01 to NA
+filt.detP <- detP
+filt.detP[filt.detP >= 0.01] <- NA
+
+# Calc number of probes above significance
+filt.detP <- filt.detP[,as.character(metadata$Sample_Name)]
+metadata["N_NA"] <- unlist(lapply(colnames(filt.detP), function(sample_id) {
+  
+  length(filt.detP[,sample_id][is.na(filt.detP[,sample_id])])
+  
+}))
+
+# Boxplot of N. NAs
+ggplot(metadata, aes(x=sex, y=N_NA, fill=sex)) + 
+  geom_boxplot() + 
+  scale_fill_manual(values=sex_pal) +
+  xlab("Gender") + ylab("Number of Probes Under\nDetection Threshold (p<0.01)") +
+  theme_bw()
+
+```
+
+#### N beads and zero intensity
+
+```{r}
+
+# Filter by < 3 beads
+rgSet <- probeFiltering(rgSet, cutbead = 3, zeroint = TRUE, verbose = TRUE)
+
+# Get probe info
+locusNames <- minfi::getManifestInfo(rgSet, "locusNames")
+typeII <- getProbeInfo(rgSet, type="II")
+typeI <- getProbeInfo(rgSet, type="I")
+
+# Remove na
+filt.b_vals <- as.matrix(na.omit(getBeta(rgSet)))
+dim(filt.b_vals)
+
+# Filter
+qnt.mSetSq <- qnt.mSetSq[which(featureNames(qnt.mSetSq) %in% rownames(filt.b_vals)),]
+fun.mSetSq <- fun.mSetSq[which(featureNames(fun.mSetSq) %in% rownames(filt.b_vals)),]
+
+```
+
+#### Visualise intensities before/after
+
+```{r}
+PlotNormDensity <- function(expr1, expr2, meta, factor, cols) {
+
+par(mfrow=c(1,2)) 
+densityPlot(expr1, sampGroups=meta[[factor]], pal=cols, main="Raw", legend=FALSE)
+densityPlot(expr2, sampGroups=meta[[factor]], pal=cols, main="Normalized", legend=FALSE)
+}
+
+# Categorical
+
+## Quantile
+
+PlotNormDensity(getBeta(mSetRaw), getBeta(qnt.mSetSq), metadata, "sex", sex_pal)
+PlotNormDensity(getBeta(mSetRaw), getBeta(qnt.mSetSq), metadata, "ARRAY_ROW", well_pal)
+PlotNormDensity(getBeta(mSetRaw), getBeta(qnt.mSetSq), metadata, "Array", array_pal)
+
+## Functional
+
+PlotNormDensity(getBeta(mSetRaw), getBeta(fun.mSetSq), metadata, "sex", sex_pal)
+PlotNormDensity(getBeta(mSetRaw), getBeta(fun.mSetSq), metadata, "ARRAY_ROW", well_pal)
+PlotNormDensity(getBeta(mSetRaw), getBeta(fun.mSetSq), metadata, "Array", array_pal)
+
+# Continuous
+
+## Quantile
+
+PlotNormDensity(getBeta(mSetRaw), getBeta(qnt.mSetSq), metadata, "stage_weeks", weeks.col_ramp(metadata$stage_weeks/max(metadata$stage_weeks))) 
+PlotNormDensity(getBeta(mSetRaw), getBeta(qnt.mSetSq), metadata, "mat_age", mat_age.col_ramp(metadata$mat_age/max(metadata$mat_age)))
+PlotNormDensity(getBeta(mSetRaw), getBeta(qnt.mSetSq), metadata, "mat_bmi", bmi.col_ramp(metadata$mat_bmi/max(metadata$mat_bmi)))
+
+## Functional
+
+PlotNormDensity(getBeta(mSetRaw), getBeta(fun.mSetSq), metadata, "stage_weeks", weeks.col_ramp(metadata$stage_weeks/max(metadata$stage_weeks)))
+PlotNormDensity(getBeta(mSetRaw), getBeta(fun.mSetSq), metadata, "mat_age", mat_age.col_ramp(metadata$mat_age/max(metadata$mat_age)))
+PlotNormDensity(getBeta(mSetRaw), getBeta(fun.mSetSq), metadata, "mat_bmi", bmi.col_ramp(metadata$mat_bmi/max(metadata$mat_bmi)))
+```
+
+#### MDS plots before/after
+
+```{r}
+
+PlotMDS <- function(expr, meta, factor, cols, topn=2500) {
+  
+  # Plot
+  return(plotMDS(minfi::getM(expr), top=topn, gene.selection="common", 
+          col=cols[factor(meta[[factor]])]))
+  
+}
+
+# MDS
+## Quantile
+png(paste0(pca_dir, "mds_biplot.quantile_norm.colbysex.png"), units="px", width=500, height=500)
+qnt.sex_mds.plt <- PlotMDS(qnt.mSetSq, metadata, factor="sex", cols=sex_pal, topn=100000)
+dev.off()
+
+png(paste0(pca_dir, "mds_biplot.quantile_norm.colbyarrayrow.png"), units="px", width=500, height=500)
+qnt.arrayrow_mds.plt <- PlotMDS(qnt.mSetSq, metadata, factor="ARRAY_ROW", cols=well_pal, topn=100000)
+dev.off()
+
+png(paste0(pca_dir, "mds_biplot.quantile_norm.colbybatch.png"), units="px", width=500, height=500)
+qnt.batch_mds.plt <- PlotMDS(qnt.mSetSq, metadata, factor="Batch", cols=batch_pal, topn=100000)
+dev.off()
+
+png(paste0(pca_dir, "mds_biplot.quantile_norm.colbybmigroup.png"), units="px", width=500, height=500)
+qnt.bmigroup_mds.plt <- PlotMDS(qnt.mSetSq, metadata, factor="BMI_GROUP", cols=bmi_cols, topn=100000)
+dev.off()
+
+png(paste0(pca_dir, "mds_biplot.quantile_norm.colbystage.png"), units="px", width=500, height=500)
+qnt.stage_mds.plt <- PlotMDS(qnt.mSetSq, metadata, factor="stage_weeks", cols=weeks.col_ramp(metadata$stage_weeks/max(metadata$stage_weeks)), topn=100000)
+dev.off()
+
+png(paste0(pca_dir, "mds_biplot.quantile_norm.colbyage.png"), units="px", width=500, height=500)
+qnt.age_mds.plt <- PlotMDS(qnt.mSetSq, metadata, factor="mat_age", cols=mat_age.col_ramp(metadata$mat_age/max(metadata$mat_age)), topn=100000)
+dev.off()
+
+png(paste0(pca_dir, "mds_biplot.quantile_norm.colbybmi.png"), units="px", width=500, height=500)
+qnt.bmi_mds.plt <- PlotMDS(qnt.mSetSq, metadata, factor="mat_bmi", cols=bmi.col_ramp(metadata$mat_bmi/max(metadata$mat_bmi)), topn=100000)
+dev.off()
+
+## Functional
+png(paste0(pca_dir, "mds_biplot.functional_norm.colbysex.png"), units="px", width=500, height=500)
+fun.sex_mds.plt <- PlotMDS(fun.mSetSq, metadata, factor="sex", cols=sex_pal, topn=100000)
+dev.off()
+
+png(paste0(pca_dir, "mds_biplot.functional_norm.colbyarrayrow.png"), units="px", width=500, height=500)
+fun.arrayrow_mds.plt <- PlotMDS(fun.mSetSq, metadata, factor="ARRAY_ROW", cols=well_pal, topn=100000)
+dev.off()
+
+png(paste0(pca_dir, "mds_biplot.functional_norm.colbybatch.png"), units="px", width=500, height=500)
+fun.batch_mds.plt <- PlotMDS(fun.mSetSq, metadata, factor="Batch", cols=batch_pal, topn=100000)
+dev.off()
+
+png(paste0(pca_dir, "mds_biplot.functional_norm.colbybmigroup.png"), units="px", width=500, height=500)
+fun.bmigroup_mds.plt <- PlotMDS(fun.mSetSq, metadata, factor="BMI_GROUP", cols=bmi_cols, topn=100000)
+dev.off()
+
+png(paste0(pca_dir, "mds_biplot.functional_norm.colbystage.png"), units="px", width=500, height=500)
+fun.stage_mds.plt <- PlotMDS(fun.mSetSq, metadata, factor="stage_weeks", cols=weeks.col_ramp(metadata$stage_weeks/max(metadata$stage_weeks)), topn=100000)
+dev.off()
+
+png(paste0(pca_dir, "mds_biplot.functional_norm.colbyage.png"), units="px", width=500, height=500)
+fun.age_mds.plt <- PlotMDS(fun.mSetSq, metadata, factor="mat_age", cols=mat_age.col_ramp(metadata$mat_age/max(metadata$mat_age)), topn=100000)
+dev.off()
+
+png(paste0(pca_dir, "mds_biplot.functional_norm.colbybmi.png"), units="px", width=500, height=500)
+fun.bmi_mds.plt <- PlotMDS(fun.mSetSq, metadata, factor="mat_bmi", cols=bmi.col_ramp(metadata$mat_bmi/max(metadata$mat_bmi)), topn=100000)
+dev.off()
+
+```
+
+#### Filter by detection p-value
+
+```{r}
+
+# ensure probes are in the same order in the mSetSq and detP objects
+detP <- detP[match(featureNames(qnt.mSetSq),rownames(detP)),] 
+
+# remove any probes that have failed in one or more samples
+keep <- rowSums(detP < 0.001) == ncol(qnt.mSetSq)  
+table(keep)
+
+# Filter by detection p-value
+qnt.mSetSqFlt <- qnt.mSetSq[keep,]
+fun.mSetSqFlt <- fun.mSetSq[keep,]
+
+```
+
+#### Filter by SNPs at CpGs
+
+```{r}
+
+# Remove all probes with SNPs at CpG site
+qnt.mSetSqFlt <- dropLociWithSnps(qnt.mSetSqFlt)
+fun.mSetSqFlt <- dropLociWithSnps(fun.mSetSqFlt)
+
+```
+
+#### Filter cross-reactive probes
+
+Based on: https://github.com/markgene/maxprobes
+
+But more detailed, esp applied to EWAS in: https://academic.oup.com/nargab/article/2/4/lqaa105/6040968
+
+Can include expansions of repeat sequences (ie GGGGCC) as for C9ORF72 observed in the above. Can have considerable impacts on EWAS, particularly affected significant results.
+
+```{r}
+
+# Get probes
+epic.xreact_probes <- xreactive_probes(array_type = "EPIC")
+
+# Drop probes
+qnt.mSetSqFlt <- dropXreactiveLoci(qnt.mSetSqFlt)
+fun.mSetSqFlt <- dropXreactiveLoci(fun.mSetSqFlt)
+
+```
+
+## Save the output for downstream steps
+
+```{r}
+saveRDS(list(qnt.mSetSqFlt=qnt.mSetSqFlt,fun.mSetSqFlt=fun.mSetSqFlt,metadata=metadata, annotdata=annotdata),file=paste0(data_dir,"preproccessed_methyl.RDS"))
+```
+
+## 

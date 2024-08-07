@@ -9,6 +9,10 @@ editor: visual
 ```{r}
 library(tidyverse)
 library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(ggplot2)
+library(cowplot)
+library(ggpubr)
+library(tidyverse)
 ```
 
 ## Load the mqtl data
@@ -36,7 +40,7 @@ dmps <- read_delim("differential_methylation/differential_methylation.limma_resu
   as.data.frame()
 
 cartilageMQTLs_sig <- cartilageMQTLs[ cartilageMQTLs$bonferroni <= 0.05,]
-dmps_sig <- dmps[ dmps$adj.P.Val <= 0.05,]
+dmps_sig <- dmps[ dmps$bonferroni <= 0.05,]
 
 overlapSize <- length(intersect(dmps_sig$Name,cartilageMQTLs_sig$gene))
 numbermQTLCpGs <- length(unique(cartilageMQTLs_sig$gene))
@@ -63,7 +67,7 @@ dmps <- read_delim("differential_methylation/differential_methylation.limma_resu
   as.data.frame()
 
 cartilageMQTLs_sig <- cartilageMQTLs[ cartilageMQTLs$bonferroni <= 0.05,]
-dmps_sig <- dmps[ dmps$adj.P.Val <= 0.05,]
+dmps_sig <- dmps[ dmps$bonferroni <= 0.05,]
 
 overlapSize <- length(intersect(dmps_sig$Name,cartilageMQTLs_sig$gene))
 numbermQTLCpGs <- length(unique(cartilageMQTLs_sig$gene))
@@ -79,6 +83,7 @@ phyper(q = overlapSize,
                  lower.tail = TRUE)
 
 ```
+
 ## Comparison to foetal brain mQTLs
 
 Take all the epigenome wide significant CpGs, filter by those also on the 450K array, and compare Y/N if they were also an mQTL in the brain paper
@@ -101,5 +106,95 @@ freq <- table(cartilageMQTLs_sig$brain)
 freq[2]/sum(freq)
 
 write.table(cartilageMQTLs_sig, "mqtl_analysis.cis_mqtls.450k_probes.genomewide_bonerroni_sig.tsv", sep="\t", quote=FALSE,row.names = FALSE,col.names = TRUE)
+
+
+library(ggvenn)
+venn <- list("Cartilage CpGs"=cartilageMQTLs_sig$gene,"Brain CpGs"=brainMQTLs$ProbeID)
+g <- ggvenn(venn,show_percentage = FALSE, text_size = 7)
+
+ggsave("mqtl/cartilage_brain_mQTL_450kfiltered_CpG_venn.png", g, units="in", width=6, height=7,bg="white")
+
+
+```
+
+### Plot effect sizes
+
+```{r}
+splitChrPos <- function(dataset){
+  string <- strsplit(dataset$CHRPOSID,split=":")
+  chr <- sapply(string,"[[",1)
+  pos <- sapply(string,"[[",2)
+  major <- sapply(string,"[[",3)
+  minor <- sapply(string,"[[",4)
+  dataset$chrposcpg <- paste(chr,pos,dataset$gene,sep=":")
+  dataset$minor <- minor
+  dataset$major <- major
+  return(dataset)
+}
+
+cartilageMQTLs_sig_brain <- cartilageMQTLs_sig[ cartilageMQTLs_sig$brain=="yes",]
+cartilageMQTLs_sig_brain <- splitChrPos(cartilageMQTLs_sig_brain)
+
+brainMQTLs$chrposcpg <- paste(brainMQTLs$SNP_Chr,brainMQTLs$SNP_BP,brainMQTLs$ProbeID,sep=":")
+
+
+combined <- merge(cartilageMQTLs_sig_brain,brainMQTLs,by="chrposcpg")
+combined <- combined[ combined$SNP_Allele == combined$minor | combined$SNP_Allele == combined$major, ]
+combined$beta.x <- ifelse(combined$minor != combined$SNP_Allele, combined$beta.x *-1 ,combined$beta.x)
+
+
+g <- ggplot(combined, aes(beta.x,beta.y)) +
+  geom_point(alpha=0.1)  +
+   geom_smooth(method = "lm", se=FALSE, color="red", formula = y ~ x) +
+  cowplot::theme_cowplot(font_size = 20) +
+  xlab("Foetal Cartilage mQTL effect size (beta)") +
+  ylab("Foetal Brain mQTLs effect size (beta)") +
+  stat_cor(size=5)
+
+
+
+ggsave("mqtl/mqtlBrainvsCartilageEffectSizes.png", g, units="in", width=7, height=5)
+
+
+```
+
+### Cartilage comparisons
+
+```{r}
+OA <- read.delim("Kreitmaier_2022_mqtl_lgcart_filtered.txt")
+
+#get the cartilage foetal mqtls
+cartilageMQTLs <- read_delim("mqtl/mqtl_analysis.cis_mqtls.genomewide.tsv") %>% as.data.frame()
+cartilageMQTLs <- cartilageMQTLs[ cartilageMQTLs$bonferroni <= 0.05,]
+
+#alter the id format to match ours
+OA$snp_chr_pos_REF_ALT <- gsub("_",":",OA$snp_chr_pos_REF_ALT)
+
+#merge where the mqtls ids are shared
+combined <- dplyr::inner_join(cartilageMQTLs, OA,by=c("CHRPOSID"="snp_chr_pos_REF_ALT","gene"="msite") )
+
+#plot the effect sizes in both datasets
+g <- ggplot(combined, aes(beta.x,beta.y)) +
+  geom_point(alpha=0.1)  +
+   geom_smooth(method = "lm", se=FALSE, color="red", formula = y ~ x) +
+  cowplot::theme_cowplot(font_size = 20) +
+  xlab("Foetal Cartilage mQTL effect size (beta)") +
+  ylab("Adult OA Cartilage mQTLs effect size (beta)") +
+  stat_cor(size=5)
+
+ggsave("mqtl/mqtlAdultvsFoetalCartilageEffectSizes.png", g, units="in", width=7, height=7, bg = "white")
+
+
+#venn of the overlap
+
+#need to filter by the 450k array
+cartilageMQTLs_450k <- cartilageMQTLs[ cartilageMQTLs$gene %in% Manifest$Name,]
+
+
+venn <- list("Foetal CpGs"=cartilageMQTLs_450k$gene,"Adult OA CpGs"=OA$msite)
+g <- ggvenn(venn,show_percentage = FALSE, text_size = 7)
+
+ggsave("mqtl/cartilage_adultOA_mQTL_450kfiltered_CpG_venn.png", g, units="in", width=6, height=7,bg="white")
+
 
 ```

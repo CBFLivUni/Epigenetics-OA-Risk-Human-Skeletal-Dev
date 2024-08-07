@@ -162,6 +162,7 @@ rgSet <- read.metharray(metadata$Basename, extended=TRUE)
 # give the samples descriptive names
 sampleNames(rgSet) <- metadata$Sample_Name
 rgSet
+rgSet@assays@data$Green
 
 ```
 
@@ -218,6 +219,40 @@ metadata[names(pred_sex_vector == lab_sex_vector),]["SEX_MATCH"] <- unname(ifels
 
 ```
 
+#### Save raw signals for GEO
+
+```{r include=FALSE}
+
+# Get methylated signal
+methMatrix <- GMsetEx@assays@data$Meth
+unmethMatrix <- GMsetEx@assays@data$Unmeth
+detPMatrix <- detectionP(rgSet)
+
+# Generate matrix signal dataset (for GEO submission)
+allSamples_signalDF <- data.frame(ID_REF=rownames(methMatrix))
+for (id in colnames(methMatrix)) {
+  
+  # Subset
+  methSignal <- methMatrix[,id]
+  unmethSignal <- unmethMatrix[,id]
+  detP <- detPMatrix[,id]
+  
+  # Get data
+  signalDF <- data.frame(Unmethylated_Signal=unname(unmethSignal),
+                         Methylated_Signal=unname(methSignal),
+                         Detection_Pval=unname(detP[names(methSignal)]))
+  colnames(signalDF) <- paste0(id, "_", colnames(signalDF))
+  
+  # Add to output
+  allSamples_signalDF <- cbind(allSamples_signalDF, signalDF)
+  
+}
+
+# Save
+write.table(allSamples_signalDF, paste0(data_dir, "methylationRawSignalMatrix_withDetPVals.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+```
+
 ### Define colour palettes
 
 ```{r}
@@ -267,7 +302,7 @@ ggplot(metadata, aes(x=reorder(Sample_Name, CHRY_MEAN), y=CHRY_MEAN, fill=SEX_MA
                                  legend.position="top")
 
 ```
- 
+
 #### Drop mismatched sex
 
 ```{r}
@@ -434,9 +469,42 @@ fun.mSetSq <- fun.mSetSq[which(featureNames(fun.mSetSq) %in% rownames(filt.b_val
 
 ```
 
+#### Save normalised data for GEO
+
+```{r eval=FALSE}
+
+
+# Get methylated signal
+betaVals <- getBeta(qnt.mSetSq)
+
+# Generate matrix norm dataset (for GEO submission)
+allSamples_normDF <- data.frame(ID_REF=rownames(betaVals))
+for (id in colnames(methMatrix)) {
+  
+  # Subset
+  betas <- betaVals[,id]
+  detP <- detPMatrix[,id]
+  
+  # Get data
+  normDF <- data.frame(unname(betas),
+                       unname(detP[names(betas)]))
+  colnames(normDF) <- c(id, "Detection_Pval")
+  
+  # Add to output
+  allSamples_normDF <- cbind(allSamples_normDF, normDF)
+  
+}
+
+# Save
+write.table(allSamples_normDF, paste0(data_dir, "methylationQntNormBetaMatrix_withDetPVals.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+
+
+```
+
 #### Visualise intensities before/after
 
 ```{r}
+
 PlotNormDensity <- function(expr1, expr2, meta, factor, cols) {
 
 par(mfrow=c(1,2)) 

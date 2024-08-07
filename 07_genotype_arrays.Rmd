@@ -1,6 +1,5 @@
 ---
 title: "Genotyping"
-output: html_notebook
 ---
 
 Preprocessing and imputation is performed using the master scripts within the scripts directory.

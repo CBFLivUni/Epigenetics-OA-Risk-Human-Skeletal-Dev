@@ -81,8 +81,8 @@ dmin <- FALSE
 ## Load the dmrs and the data
 ```{r}
 
-# Load in m-lvaues
-mvals <- read.delim(paste0(res_dir, "methylation_matrix.mvals.tsv"), sep="\t", header=TRUE, row.names=1)
+# Load in m-values
+mvals <- read.delim(paste0(res_dir, "fun_methylation_matrix.mvals.tsv"), sep="\t", header=TRUE, row.names=1)
 
 # Load in Stage CpGs
 sigCpG_stage <- read.delim(paste0(de_dir, "differential_methylation.limma_results.continuous_covariates.treat_log2FC",trt_log2fc_thr,"_thr.tsv"), sep="\t", header=TRUE)
@@ -99,8 +99,8 @@ rownames(stage_dmr) <- stage_dmr$CpG
 rownames(sex_dmr) <- sex_dmr$CpG
 
 # Keep just sig CpGs
-sigCpG_stage <- sigCpG_stage[sigCpG_stage$adj.P.Val < 0.001,]
-sigCpG_sex <- sigCpG_sex[sigCpG_sex$adj.P.Val < 0.05,]
+sigCpG_stage <- sigCpG_stage[sigCpG_stage$bonferroni  < 0.05,]
+sigCpG_sex <- sigCpG_sex[sigCpG_sex$bonferroni < 0.05,]
 sigCpG_stageDmr <- stage_dmr[stage_dmr$SigCpG != "ns",]
 sigCpG_sexDmr <- sex_dmr[sex_dmr$SigCpG != "ns",]
 
@@ -186,7 +186,9 @@ if (dmin) {
 ## Check optimal clusters visually
 
 ```{r}
+#set seed results not dependent of running Dmin workflow or not
 
+set.seed(seed_val)
 # Loop over expdatas
 for (name in names(expDatas)) {
   
@@ -364,11 +366,11 @@ table(SexDmr_df$CLUSTER); intersect(SexDmr_df[SexDmr_df$CLUSTER == 0,]$CpG, rown
 
 # Assemble to output
 StageDmr_df <- StageDmr_df[,
-  c("DMR_ID","SITE","chr","start","end","SYMBOL","DISTANCE","B","S","estimate","se","z","p.value","p.adjust","CONTRAST","MAXGAP","CpG","pos","CLUSTER","logFC","P.Value","adj.P.Val","n","nSigCpg","nNonSigCpg","pSigCpg")]
-colnames(StageDmr_df)[c(13,14,20,21,22)] <- c("DMR_PVAL","DMR_PADJ","CPG_ESTIMATE","CPG_PVAL","CPG_PADJ")
+  c("DMR_ID","SITE","chr","start","end","SYMBOL","DISTANCE","B","S","estimate","se","z","p.value","p.adjust","CONTRAST","MAXGAP","CpG","pos","CLUSTER","logFC","P.Value","adj.P.Val","probe_bonferroni","n","nSigCpg","nNonSigCpg","pSigCpg")]
+colnames(StageDmr_df)[c(13,14,20,21,22,23)] <- c("DMR_PVAL","DMR_PADJ","CPG_ESTIMATE","CPG_PVAL","CPG_PADJ","CPG_BONFERRONI")
 SexDmr_df <- SexDmr_df[,
-  c("DMR_ID","SITE","chr","start","end","SYMBOL","DISTANCE","B","S","estimate","se","z","p.value","p.adjust","CONTRAST","MAXGAP","CpG","pos","CLUSTER","logFC","P.Value","adj.P.Val","n","nSigCpg","nNonSigCpg","pSigCpg")]
-colnames(SexDmr_df)[c(13,14,20,21,22)] <- c("DMR_PVAL","DMR_PADJ","CPG_ESTIMATE","CPG_PVAL","CPG_PADJ")
+  c("DMR_ID","SITE","chr","start","end","SYMBOL","DISTANCE","B","S","estimate","se","z","p.value","p.adjust","CONTRAST","MAXGAP","CpG","pos","CLUSTER","logFC","P.Value","adj.P.Val","probe_bonferroni","n","nSigCpg","nNonSigCpg","pSigCpg")]
+colnames(SexDmr_df)[c(13,14,20,21,22,23)] <- c("DMR_PVAL","DMR_PADJ","CPG_ESTIMATE","CPG_PVAL","CPG_PADJ","CPG_BONFERRONI")
 
 # Save
 write.table(StageDmr_df[order(as.numeric(gsub("dDMR_","",StageDmr_df$DMR_ID)), decreasing=FALSE),], 
@@ -385,7 +387,10 @@ write.table(SexDmr_df[order(as.numeric(gsub("sDMR_","",SexDmr_df$DMR_ID)), decre
 ```{r}
 
 # Read in
-CpGTrt_df <- read.table(paste0(de_dir, "differential_methylation.limma_results.continuous_covariates.treat_log2FC",trt_log2fc_thr,"_thr.padj_thr",0.001,".tsv"), sep="\t", header=TRUE, quote = "")
+CpGTrt_df <- read.table(paste0(de_dir, "differential_methylation.limma_results.continuous_covariates.treat_log2FC",trt_log2fc_thr,"_thr.tsv"), sep="\t", header=TRUE, quote = "")
+
+CpGTrt_df <- CpGTrt_df[ CpGTrt_df$bonferroni <= 0.05,]
+
 CpGEby_df <- read.table(paste0(de_dir, "differential_methylation.limma_results.continuous_covariates.ebayes_adjusted.padj_thr",0.05,".tsv"), sep="\t", header=TRUE, quote = "")
 StageCpG_df <- CpGTrt_df[CpGTrt_df$CONTRAST == "Z_STAGE_WEEKS",]
 SexCpG_df <- CpGEby_df[CpGEby_df$CONTRAST == "sexmale - sexfemale",]
@@ -481,7 +486,7 @@ for (direction in c("all")) {
     print(paste0("RUNNING FOR :- ",direction))
     up_goCpGStage <- RunMethylEnrichment(stageCpG, groupCol="CLUSTER", cpg_df=backSet[,c("Name","CONTRAST")], groupIsBackGroundSubset=FALSE,
                                                sig_cpgs=sig_cpgs[unique(stageCpG$CLUSTER)], cpg_level=TRUE, array.type="EPIC",
-                                               pval_col="adj.P.Val", dir=goclust_dir, CpGCol="Name", extra=paste0(".",direction,"CpGStage"))
+                                               pval_col="bonferroni", dir=goclust_dir, CpGCol="Name", extra=paste0(".",direction,"CpGStage"))
      
   # ELse if down
   } else if (direction == "down") { 
@@ -492,7 +497,7 @@ for (direction in c("all")) {
     print(paste0("RUNNING FOR :- ",direction))
     down_goCpGStage <- RunMethylEnrichment(stageCpG, groupCol="CLUSTER", cpg_df=backSet[,c("Name","CONTRAST")], groupIsBackGroundSubset=FALSE,
                                                  sig_cpgs=sig_cpgs[unique(stageCpG$CLUSTER)], cpg_level=TRUE, array.type="EPIC",
-                                                 pval_col="adj.P.Val", dir=goclust_dir, CpGCol="Name", extra=paste0(".",direction,"CpGStage"))
+                                                 pval_col="bonferroni", dir=goclust_dir, CpGCol="Name", extra=paste0(".",direction,"CpGStage"))
     
   # Else if all comparisons
   } else if (direction == "all") {
@@ -503,7 +508,7 @@ for (direction in c("all")) {
     print(paste0("RUNNING FOR :- ",direction))
     all_goCpGStage <- RunMethylEnrichment(stageCpG, groupCol="CLUSTER", cpg_df=backSet[,c("Name","CONTRAST")], groupIsBackGroundSubset=FALSE,
                                                 sig_cpgs=sig_cpgs[unique(stageCpG$CLUSTER)], cpg_level=TRUE, array.type="EPIC",
-                                                pval_col="adj.P.Val", dir=goclust_dir, CpGCol="Name", extra=paste0(".",direction,"CpGStage"))
+                                                pval_col="bonferroni", dir=goclust_dir, CpGCol="Name", extra=paste0(".",direction,"CpGStage"))
     
   }
   
@@ -515,7 +520,7 @@ for (direction in c("all")) {
 
 #### CpGs
 
-```{r}
+```{r }
 
 # Plot
 ## Loop over clusters

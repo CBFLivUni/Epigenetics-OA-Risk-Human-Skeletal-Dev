@@ -51,11 +51,11 @@ We use the estimate values to bin the dmrs into roughly equally sized bins.
 
 ```{r}
 # bin using with a zero group
-bins <- bin(x = dmrs$estimate, binmode = "equalN", nElement = 1000, 
+bins <- bin(x = dmrs$estimate, binmode = "equalN", nElement = 1400, 
             minAbsX = 0.5)
 
 #for the file
-png("dDMR_bins.png",width = 7, height=7, units="in", res=600)
+pdf("dDMR_bins.pdf",width = 7, height=7)
 plotBinDensity(dmrs$estimate, bins, legend = "top",xlab="Estimate")
 title("dDMR bins by Estimate")
 dev.off()
@@ -125,7 +125,7 @@ pwms
 
 JASPAR provides a smaller collection of vertebrate motifs
 
-```{r}
+```{r eval=FALSE}
 pwmsJASPAR <- getMatrixSet(JASPAR2020,
                      opts = list(matrixtype = "PWM",
                                  tax_group = "vertebrates"))
@@ -173,9 +173,9 @@ seHOMO <- calcBinnedMotifEnrR(seqs = dmrseqs, bins = bins,
                           pwmL = pwms,BPPARAM = SerialParam(),
                           verbose = TRUE)
 
-seJASPAR <- calcBinnedMotifEnrR(seqs = dmrseqs, bins = bins,
-                          pwmL = pwmsJASPAR,BPPARAM = SerialParam(),
-                          verbose = TRUE)
+# seJASPAR <- calcBinnedMotifEnrR(seqs = dmrseqs, bins = bins,
+#                           pwmL = pwmsJASPAR,BPPARAM = SerialParam(),
+#                           verbose = TRUE)
 ```
 
 ### Summarise the results
@@ -243,7 +243,7 @@ getHeatmap <- function(se,motifLib){
   # plot the heatmaps with and with the motif seq logos
   # rowData(seSel)$motif.name <- word(rowData(seSel)$motif.name,1,sep = "\\.")
   
-  png(sprintf("dDMR_%s_heatmap.png",motifLib),width = 7, height=9, units="in", res=600)
+  pdf(sprintf("dDMR_%s_heatmap.pdf",motifLib),width = 7, height=9)
   heatmap <- plotMotifHeatmaps(x = seSel, which.plots = c("log2enr", "negLog10Padj"), 
                     width = 2.0, cluster = TRUE, maxEnr = 2, maxSig = 10, 
                     show_motif_GC = TRUE)
@@ -254,7 +254,7 @@ getHeatmap <- function(se,motifLib){
   SimMatSel <- motifSimilarity(rowData(seSel)$motif.pfm)
   hcl <- hclust(as.dist(1 - SimMatSel), method = "average")
   
-  png(sprintf("dDMR_%s_heatmapWithMotifs.png",motifLib),width = 12, height=9, units="in", res=600)
+  pdf(sprintf("dDMR_%s_heatmapWithMotifs.png",motifLib),width = 12, height=9)
   heatMapWithMotif <- plotMotifHeatmaps(x = seSel, which.plots = c("log2enr", "negLog10Padj"), 
                     width = 1.8, cluster = hcl, maxEnr = 2, maxSig = 10,
                     show_dendrogram = TRUE, show_seqlogo = TRUE,
@@ -267,7 +267,7 @@ getHeatmap <- function(se,motifLib){
   
 }
 heatmapsHOMO <- getHeatmap(seHOMO,"hocomoco")
-heatmapsJASPAR <- getHeatmap(seJASPAR,"JASPAR")
+#heatmapsJASPAR <- getHeatmap(seJASPAR,"JASPAR")
 
 ```
 
@@ -279,7 +279,7 @@ hocomoco heatmap clustered by the enrichment scores
 #| fig-width: 7
 #| fig-height: 9
 
-png("results/dmr/heatmapsHOMO.png",width = 8,height = 12,units="in",res=600)
+pdf("results/dmr/heatmapsHOMO.pdf",width = 8,height = 12)
 heatmapsHOMO$heatmap
 dev.off()
 
@@ -292,7 +292,11 @@ hocomoco heatmap clustered by the motif similarity
 #| fig-width: 9
 #| fig-height: 10
 
-png("results/dmr/heatmapsHOMOWithMotifs.png",width = 8,height = 14,units="in",res=600)
+png("results/dmr/heatmapsHOMOWithMotifs.png",width = 9,height = 10,units="in",res=600)
+heatmapsHOMO$heatMapWithMotif
+dev.off()
+
+pdf("figures/Fig4A_heatmapsHOMOWithMotifs.pdf",width = 9,height = 10)
 heatmapsHOMO$heatMapWithMotif
 dev.off()
 heatmapsHOMO$heatMapWithMotif
@@ -305,7 +309,7 @@ jaspar heatmap clustered by the enrichment scores
 ```{r}
 #| fig-width: 7
 #| fig-height: 13
-heatmapsJASPAR$heatmap
+# heatmapsJASPAR$heatmap
 ```
 
 jaspar heatmap clustered by the motif similarity
@@ -313,5 +317,5 @@ jaspar heatmap clustered by the motif similarity
 ```{r}
 #| fig-width: 9
 #| fig-height: 13
-heatmapsJASPAR$heatMapWithMotif
+# heatmapsJASPAR$heatMapWithMotif
 ```

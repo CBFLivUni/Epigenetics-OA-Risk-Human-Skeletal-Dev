@@ -227,16 +227,16 @@ plotColoc <- function(dataset1,dataset2,colocResult,mqtlData){
   #get the datasets
   dataset1 <- bind_cols(dataset1) %>%
     mutate(logpval=-log10(pvalue)) %>%
-    select(snp,position,logpval)
+    dplyr::select(snp,position,logpval)
   dataset2 <- bind_cols(dataset2) %>%
     mutate(logpval=-log10(pvalues)) %>%
-        select(snp,position,logpval)
+        dplyr::select(snp,position,logpval)
   
   #combine the the datasets using the common snps
   datasets <- list(mQTL=dataset1,GWAS=dataset2)
   dataset <- bind_rows(datasets,.id = "ids") %>%
     group_by(snp) %>% 
-    filter(n()>1)
+    dplyr::filter(n()>1)
   
   #plot the snps and the cpg position
   #note that the lead snp may not acually be measured in the mqtl data
@@ -365,7 +365,9 @@ dataset2 <- plotData[[1]][[3]]
       ggrepel::geom_label_repel(data=cpg,aes(label=cpgLabel))
     
 
-    cowplot::save_plot("mqtl/coloc/rs11071366_coloc_withLD.png",g,base_height = 5,base_width=5,bg="white")
+ cowplot::save_plot("mqtl/coloc/rs11071366_coloc_withLD.png",g,base_height = 5,base_width=5,bg="white")
+    
+cowplot::save_plot("figures/Fig5B_rs11071366_coloc_withLD.pdf",g,base_height = 5,base_width=5,bg="white")
 
   
 ```

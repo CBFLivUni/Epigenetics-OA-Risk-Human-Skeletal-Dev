@@ -12,6 +12,11 @@ library(ggplot2)
 library(RColorBrewer)
 library(scales)
 library(colorspace)
+library(cowplot)
+library(npreg)
+library(ComplexHeatmap)
+library(patchwork)
+library(circlize)
 
 # Data QC 
 library(wateRmelon)
@@ -39,6 +44,7 @@ library(sva)
 library(pvca)
 library(dmrff)
 library(DMRcate)
+library(variancePartition)
 
 # Gene ontology
 library(clusterProfiler)
@@ -51,6 +57,7 @@ library(clusterProfiler)
 ```{r}
 #set the treat log2 treshold
 trt_log2fc_thr <- 0.1
+propProbes_varPart <- 0.1
 
 ```
 
@@ -80,7 +87,6 @@ metadata <- preProccessedData$metadata
 annotdata <- preProccessedData$annotdata
 ```
 
-### Define colour palettes
 
 ```{r}
 
@@ -101,14 +107,45 @@ bmi.col_ramp <- colour_ramp(c("white","darkorange"), na.color="grey", alpha=TRUE
 
 ```
 
-#### Scale data
+#### Correlate PCs with continuous metadata
 
 ```{r}
+
+# Read in expanded metadata
+expandedMeta <- readxl::read_xlsx("Additional-MEtadata.xlsx", sheet=1)
+table(expandedMeta$`Processing Date`)
+
+# Fix variables
+expandedMeta["PROC_DATE"] <- as.character(as.numeric(expandedMeta$`Processing Date`))
+
+# Combine with PCA metadata
+metadata <- merge(metadata, expandedMeta[,c("Embryo ID","Tissue (mg)","PROC_DATE", "DNA (ng/ul)", "Total DNA", "DNA (ng/mg)", "260/280")], by.x="Sample_Name", by.y="Embryo ID")
+
+```
+
+
+#### Pre-process metadata 
+
+```{r}
+
+# Scale covariates
+metadata["Batch"] <- paste0("B_",metadata$Batch)
+batch_pal <- brewer.pal(length(unique(metadata$Batch)),"Set1"); names(batch_pal) <- unique(metadata$Batch) 
+
+metadata["Z_DNAul"] <- scale(metadata$`DNA (ng/ul)`, center=TRUE, scale=TRUE)
+metadata["Z_DNAmg"] <- scale(metadata$`DNA (ng/mg)`, center=TRUE, scale=TRUE)
+metadata["Z_TISSUEmg"] <- scale(metadata$`Tissue (mg)`, center=TRUE, scale=TRUE)
+metadata["Z_RRNA_ABSORB"] <- scale(metadata$`260/280`, center=TRUE, scale=TRUE)
 
 # Scale data
 metadata["Z_STAGE_WEEKS"] <- scale(metadata$stage_weeks, scale=TRUE, center=TRUE)
 metadata["Z_MAT_BMI"] <- scale(metadata$mat_bmi, scale=TRUE, center=TRUE)
 metadata["Z_MAT_AGE"] <- scale(metadata$mat_age, scale=TRUE, center=TRUE)
+rownames(metadata) <- metadata$Sample_Name
+
+# Fix id names
+metadata$Sample_Name <- as.character(metadata$Sample_Name)
+rownames(metadata) <- metadata$Sample_Name
 
 ```
 
@@ -133,33 +170,95 @@ fun.m_mat <- fun.m_mat[order(rowVars(fun.m_mat), decreasing=TRUE),]
 
 No surrogate variables after taking into account known batch. Currently errors with `Error in solve.default(t(mod0) %*% mod0) : 'a' is 0-diml`.
 
-# Define matrices
+```{r}
 
-modBatch \<- model.matrix(\~ 0 + sex + Batch + Z_STAGE_WEEKS + Z_MAT_BMI + Z_MAT_AGE, data=metadata) modRow \<- model.matrix(\~ 0 + sex + ARRAY_ROW + Z_STAGE_WEEKS + Z_MAT_BMI + Z_MAT_AGE, data=metadata) mod0 \<- model.matrix(\~ 0, data=metadata)
+# Define matrices
+set.seed(42)
+
+# Drop probes with problem values
+dim(fun.m_mat)
+fun.m_mat <- fun.m_mat[apply(fun.m_mat, 1, function(row) all(!is.na(row)) & all(is.finite(row))),]
+dim(fun.m_mat)
+
+# Define models
+modBatch <- model.matrix(~ 0 + sex + Batch + Z_STAGE_WEEKS + Z_MAT_BMI + Z_MAT_AGE, data=metadata) 
+modBatchBig <- model.matrix(~ 0 + sex + Batch + Z_STAGE_WEEKS + Z_MAT_BMI + Z_MAT_AGE + Z_DNAul +  Z_TISSUEmg + Z_RRNA_ABSORB, data=metadata) 
 
 # Run SV analysis
+nSVBatch <- num.sv(fun.m_mat[,rownames(modBatch)], modBatch, method="leek"); nSVBatch 
+nSVBatchBig <- num.sv(fun.m_mat[,rownames(modBatchBig)], modBatchBig, method="leek"); nSVBatchBig
 
-nSVBatch \<- num.sv(qnt.m_mat\[,rownames(modBatch)\], modBatch, method="leek"); nSVBatch nSVRow \<- num.sv(qnt.m_mat\[,rownames(modRow)\], modRow, method="leek"); nSVRow
+```
 
-# Get results
 
-svObjBatch \<- sva(qnt.m_mat, modBatch, mod0, n.sv=nSVBatch); svObjBatch svObjRow \<- sva(qnt.m_mat, modRow, mod0, n.sv=nSVRow); svObjRow
 
 #### Combat
 
 This checks how equivalent array row and sentrix id (batch) are and which is best to adjust for.
 
-Have to drop sex due to confounding. But shouldn't have a huge impact really.
 
 ```{r}
 
 # Define combat matrix
-modCombat <- model.matrix(~ 0 + Z_STAGE_WEEKS + Z_MAT_BMI + Z_MAT_AGE, data=metadata)
+modCombat <- model.matrix(~ sex + Z_MAT_BMI + Z_STAGE_WEEKS + Z_MAT_AGE + Z_RRNA_ABSORB + Z_DNAul +  Z_TISSUEmg, data=metadata)
 
 # Adjust
 metadata$Sample_Name <- as.character(metadata$Sample_Name)
-combatBatchAdj <- ComBat(dat=qnt.m_mat[,metadata$Sample_Name], batch=metadata$Batch, mod=modCombat[rownames(metadata),], par.prior=TRUE, prior.plots=TRUE)
-combatRowAdj <- ComBat(dat=qnt.m_mat[,metadata$Sample_Name], batch=metadata$ARRAY_ROW, mod=modCombat[rownames(metadata),], par.prior=TRUE, prior.plots=TRUE)
+combatBatchAdj <- ComBat(dat=fun.m_mat[,metadata$Sample_Name], batch=metadata$Batch, mod=modCombat[rownames(metadata),], par.prior=TRUE, prior.plots=TRUE)
+combatRowAdj <- ComBat(dat=fun.m_mat[,metadata$Sample_Name], batch=metadata$ARRAY_ROW, mod=modCombat[rownames(metadata),], par.prior=TRUE, prior.plots=TRUE)
+
+```
+
+#### Fit variance partition models
+
+Note that when including a random slope \[ie (XXX + 0\|YYY)\], total variance won't sum to 1. So % bar plots aren't applicable.
+
+```{r eval=FALSE}
+set.seed(42)
+
+# Define formula 
+varPartFormula <- ~ (1|sex) + (1|Batch) + Z_MAT_BMI + Z_STAGE_WEEKS + Z_MAT_AGE + Z_RRNA_ABSORB + Z_DNAul + Z_TISSUEmg
+
+
+metadata$Batch <- paste0("B_",metadata$Batch)
+metadata$PROC_DATE <- paste0("B_",metadata$PROC_DATE)
+# Fit models
+varPart <- fitExtractVarPartModel(fun.m_mat[sample(1:nrow(fun.m_mat), floor(propProbes_varPart*nrow(fun.m_mat))),], varPartFormula, metadata)
+# varPartBatch <- fitExtractVarPartModel(combatBatchAdj[sample(1:nrow(combatBatchAdj), floor(propProbes_varPart*nrow(combatBatchAdj))),metadata$Sample_Name], varPartFormula, metadata)
+# varPartRow <- fitExtractVarPartModel(combatRowAdj[sample(1:nrow(combatRowAdj), floor(propProbes_varPart*nrow(combatRowAdj))),metadata$Sample_Name], varPartFormula, metadata)
+saveRDS(varPart, paste0(pca_dir, "varPartition_model"))
+# saveRDS(varPartBatch, paste0(pca_dir, "varPartition_batchAdjust_model"))
+
+
+
+
+# Plot
+varPartPlt <- sortCols(varPart) %>% plotVarPart() +
+  cowplot::theme_cowplot(font_size = 16) + 
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Variance Partition Analysis: Un-Adjusted")
+
+# 
+# varPartBatchPlt <- plotVarPart(varPartBatch) + 
+#                           theme_bw(base_size=24) + 
+#                           theme(axis.title=element_text(size=42),
+#                                 axis.text.x=element_text(size=32, angle=90, hjust=1, vjust=0.5),
+#                                 legend.text=element_text(size=16),
+#                                 legend.title=element_blank()) + 
+#                           ggtitle("Variance Partition Analysis: Sentrix ID Batch-Adjusted")
+# varPartRowPlt <- plotVarPart(varPartBatch) + 
+#                           theme_bw(base_size=24) + 
+#                           theme(axis.title=element_text(size=42),
+#                                 axis.text.x=element_text(size=32, angle=90, hjust=1, vjust=0.5),
+#                                 legend.text=element_text(size=16),
+#                                 legend.title=element_blank()) + 
+#                           ggtitle("Variance Partition Analysis: Sentrix Posiiton Batch-Adjusted")
+
+# Plot
+ggsave(paste0(pca_dir, "foetalSamples_varPartitionPlot.png"), varPartPlt, width=7, height=5, units="in")
+# ggsave(paste0(pca_dir, "foetalSamples_sentrixIDAdjusted_varPartitionPlot.png"), varPartBatchPlt, width=6000, height=5000, units="px")
+# ggsave(paste0(pca_dir, "foetalSamples_sentrixPositionAdjusted_varPartitionPlot.png"), varPartBatchPlt, width=6000, height=5000, units="px")
 
 ```
 
@@ -186,41 +285,108 @@ row.pca_metadata <- merge(metadata[,!grepl("^PC",colnames(metadata))], row.pca_r
 
 ```
 
-#### Plot Quantile PCA
+#### Plot Functional Normalisation PCA
 
 ```{r}
 
 # Reorder sex match
-qnt.pca_metadata$SEX_MATCH <- factor(qnt.pca_metadata$SEX_MATCH, levels=c("DIFFERENT","SAME"))
+fun.pca_metadata$SEX_MATCH <- factor(fun.pca_metadata$SEX_MATCH, levels=c("DIFFERENT","SAME"))
 
 # Loop over consecutive PCs
 for (pc in list(c(1,2), c(2,3), c(3,4), c(4,5))) {
 
   # Generate plots
-  sex_plt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="sex", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=c("green","mediumpurple"))
-  row_plt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="ARRAY_ROW", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=well_pal)
-  bmig_plt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="BMI_GROUP", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=bmi_cols)
-  batch_plt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="Batch", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=batch_pal)
-  age_plt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="mat_age", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkblue", low="white")
-  weeks_plt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="stage_weeks", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkgreen", low="white")
-  tri_plt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="TRIMESTER", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=c("#FEE391", "#EC7014", "#662506"))
-  bmi_plt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="mat_bmi", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkorange", low="white")
+  sex_plt <- Plot2DPCA(meta=fun.pca_metadata, var=get_eigenvalue(fun.pca_res), color_by="sex", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=c("green","mediumpurple"))
+  row_plt <- Plot2DPCA(meta=fun.pca_metadata, var=get_eigenvalue(fun.pca_res), color_by="ARRAY_ROW", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=well_pal)
+  bmig_plt <- Plot2DPCA(meta=fun.pca_metadata, var=get_eigenvalue(fun.pca_res), color_by="BMI_GROUP", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=bmi_cols)
+  batch_plt <- Plot2DPCA(meta=fun.pca_metadata, var=get_eigenvalue(fun.pca_res), color_by="Batch", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=batch_pal)
+  age_plt <- Plot2DPCA(meta=fun.pca_metadata, var=get_eigenvalue(fun.pca_res), color_by="mat_age", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkblue", low="white")
+  weeks_plt <- Plot2DPCA(meta=fun.pca_metadata, var=get_eigenvalue(fun.pca_res), color_by="stage_weeks", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkgreen", low="white")
+  tri_plt <- Plot2DPCA(meta=fun.pca_metadata, var=get_eigenvalue(fun.pca_res), color_by="TRIMESTER", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=c("#FEE391", "#EC7014", "#662506"))
+  bmi_plt <- Plot2DPCA(meta=fun.pca_metadata, var=get_eigenvalue(fun.pca_res), color_by="mat_bmi", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkorange", low="white")
+  proc_plt <- Plot2DPCA(meta=fun.pca_metadata, var=get_eigenvalue(fun.pca_res), color_by="PROC_DATE", label_id="Sample_Name", pcs=pc)
   
   # Save
   dir.create(paste0(pca_dir, "unadjusted/"), recursive=TRUE)
-  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.qnt_norm.pc",paste(pc, collapse=""),".colby_sex.propprobes",prop_probes.by_var,".png"), sex_plt, units="px", width=3000, height=3000)
-  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.qnt_norm.pc",paste(pc, collapse=""),".colby_arrayrow.propprobes",prop_probes.by_var,".png"), row_plt, units="px", width=3000, height=3000)
-  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.qnt_norm.pc",paste(pc, collapse=""),".colby_bmigroup.propprobes",prop_probes.by_var,".png"), bmig_plt, units="px", width=3000, height=3000)
-  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.qnt_norm.pc",paste(pc, collapse=""),".colby_batch.propprobes",prop_probes.by_var,".png"), batch_plt, units="px", width=3000, height=3000)
-  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.qnt_norm.pc",paste(pc, collapse=""),".colby_maternalage.propprobes",prop_probes.by_var,".png"), age_plt, units="px", width=3000, height=3000)
-  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.qnt_norm.pc",paste(pc, collapse=""),".colby_stageweeks.propprobes",prop_probes.by_var,".png"), weeks_plt, units="px", width=3000, height=3000)
-  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.qnt_norm.pc",paste(pc, collapse=""),".colby_trimester.propprobes",prop_probes.by_var,".png"), tri_plt, units="px", width=3000, height=3000)
-  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.qnt_norm.pc",paste(pc, collapse=""),".colby_bmi.propprobes",prop_probes.by_var,".png"), bmi_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.fun_norm.pc",paste(pc, collapse=""),".colby_sex.propprobes",prop_probes.by_var,".png"), sex_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.fun_norm.pc",paste(pc, collapse=""),".colby_arrayrow.propprobes",prop_probes.by_var,".png"), row_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.fun_norm.pc",paste(pc, collapse=""),".colby_bmigroup.propprobes",prop_probes.by_var,".png"), bmig_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.fun_norm.pc",paste(pc, collapse=""),".colby_batch.propprobes",prop_probes.by_var,".png"), batch_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.fun_norm.pc",paste(pc, collapse=""),".colby_maternalage.propprobes",prop_probes.by_var,".png"), age_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.fun_norm.pc",paste(pc, collapse=""),".colby_stageweeks.propprobes",prop_probes.by_var,".png"), weeks_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.fun_norm.pc",paste(pc, collapse=""),".colby_trimester.propprobes",prop_probes.by_var,".png"), tri_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.fun_norm.pc",paste(pc, collapse=""),".colby_bmi.propprobes",prop_probes.by_var,".png"), bmi_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "unadjusted/pca_biplot.fun_norm.pc",paste(pc, collapse=""),".colby_processDate.propprobes",prop_probes.by_var,".png"), proc_plt, units="px", width=3000, height=3000)
   
 }
 
 
 ```
+
+#### Compare functional vs quantile normalisation
+```{r}
+weeks_plt_qnt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="stage_weeks", label_id="Sample_Name", pcs=1:2) + scale_fill_gradient(high="darkgreen", low="white") +theme(legend.position = "right") + ggtitle("Quantile normalisation - Stage")
+weeks_plt_fun <- Plot2DPCA(meta=fun.pca_metadata, var=get_eigenvalue(fun.pca_res), color_by="stage_weeks", label_id="Sample_Name", pcs=1:2) + scale_fill_gradient(high="darkgreen", low="white") +theme(legend.position = "right") + ggtitle("Functional normalisation - Stage")
+
+batch_plt_qnt <- Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="Batch", label_id="Sample_Name", pcs=1:2) + scale_fill_manual(values=batch_pal) +theme(legend.position = "right") + ggtitle("Quantile normalisation - Batch")
+batch_plt_fun <- Plot2DPCA(meta=fun.pca_metadata, var=get_eigenvalue(fun.pca_res), color_by="Batch", label_id="Sample_Name", pcs=1:2) + scale_fill_manual(values=batch_pal)+theme(legend.position = "right") + ggtitle("Functional normalisation - Batch")
+
+pcas <- (weeks_plt_qnt + weeks_plt_fun)/(batch_plt_qnt+batch_plt_fun) +  patchwork::plot_annotation(tag_levels = 'A')
+
+ggsave(paste0(pca_dir, "unadjusted/pca_comparisons.png"), pcas, units="in", width=12, height=10)
+ggsave("figures/SuppFig_pca_comparisons.pdf", pcas, units="in", width=12, height=10)
+
+
+
+weeks_plt_fun <- Plot2DPCA(meta=fun.pca_metadata, var=get_eigenvalue(fun.pca_res), color_by="stage_weeks", label_id="Sample_Name", pcs=1:2) + scale_fill_gradient(high="darkgreen", low="white") +theme(legend.position = "right") + labs(fill="Stage\n(Weeks)")
+
+ggsave(paste0(pca_dir, "unadjusted/Fig1A_pca_stage.png"), weeks_plt_fun, units="in", width=7, height=5)
+ggsave("figures/Fig1A_pca_stage.pdf", weeks_plt_fun, units="in", width=7, height=5)
+
+```
+Correlation of covariates to the PCs
+```{r}
+
+covariates <- metadata[,c("sex","Batch","mat_bmi","stage_weeks","mat_age","260/280","DNA (ng/ul)","Tissue (mg)")]
+covariates$Batch <- as.numeric(as.factor(covariates$Batch))
+covariates$sex <- as.numeric(as.factor(covariates$sex))
+
+#significance
+
+n <- t(!is.na(covariates)) %*% (!is.na(fun.pca_metadata[,paste0("PC",1:15)]))
+r <- cor(covariates,fun.pca_metadata[,paste0("PC",1:15)]) 
+
+cor2pvalue = function(r, n) {
+  t <- (r*sqrt(n-2))/sqrt(1-r^2)
+  p <- 2*(1 - pt(abs(t),(n-2)))
+  se <- sqrt((1-r*r)/(n-2))
+  out <- list(r, n, t, p, se)
+  names(out) <- c("r", "n", "t", "p", "se")
+  return(out)
+}
+# get a list with matrices of correlation, pvalues, standard error, etc.
+corSig <- cor2pvalue(r,n)$p
+
+
+col_fun = colorRamp2(c(-1, 0, 1), c("lightblue", "white", "red"))
+
+pdf("figures/SuppFig_pca_correlation.pdf", width=8, height=7)
+Heatmap(r,cluster_columns=FALSE, name= "Pearson\nCorrelation", col = col_fun, cell_fun = function(j, i, x, y, w, h, fill) {
+    if(corSig[i, j] < 0.001) {
+        grid.text("***", x, y,gp = gpar(fontsize = 18))
+    } else if(corSig[i, j] < 0.01) {
+        grid.text("**", x, y,gp = gpar(fontsize = 18))
+    } else if(corSig[i, j] < 0.05) {
+        grid.text("*", x, y,gp = gpar(fontsize = 18))
+    }
+  })
+dev.off()
+
+```
+
+
+
+
 
 #### Plotting of batch effect (sentrix ID) in the four PCA plots
 
@@ -228,17 +394,32 @@ for (pc in list(c(1,2), c(2,3), c(3,4), c(4,5))) {
 
 #loop through the PC combinations
 pcs <- list(c(1,2), c(2,3), c(3,4), c(4,5))
-plots <- lapply(pcs,function(pc) Plot2DPCA(meta=qnt.pca_metadata, var=get_eigenvalue(qnt.pca_res), color_by="Batch", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=batch_pal) +  cowplot::theme_cowplot(font_size = 18))
+plots <- lapply(pcs,function(pc) Plot2DPCA(meta=fun.pca_metadata, var=get_eigenvalue(fun.pca_res), color_by="Batch", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=batch_pal) +  cowplot::theme_cowplot(font_size = 18))
 
 #make one plot
 batchPlot <- plot_grid(plotlist = plots,labels=LETTERS[1:4])
 
 #save the combined plot
 ggsave(paste0(pca_dir, "unadjusted/batchEffectPCA.png"), batchPlot, units="in", width=12, height=7,bg = "white")
+ggsave("figures/SuppFig_batchEffectPCA.pdf", batchPlot, units="in", width=12, height=7,bg = "white")
 
 ```
 
+#### Plotting of stage (sentrix ID) in the four PCA plots
 
+```{r}
+
+#loop through the PC combinations
+pcs <- list(c(1,2), c(2,3), c(3,4), c(4,5))
+plots <- lapply(pcs,function(pc) Plot2DPCA(meta=fun.pca_metadata, var=get_eigenvalue(fun.pca_res), color_by="stage_weeks", label_id="Sample_Name", pcs=pc) +  scale_fill_gradient(high="darkgreen", low="white") +  cowplot::theme_cowplot(font_size = 18))
+
+#make one plot
+stagePlot <- plot_grid(plotlist = plots,labels=LETTERS[1:4])
+
+#save the combined plot
+ggsave(paste0(pca_dir, "unadjusted/stageEffectPCA.png"), stagePlot, units="in", width=12, height=7,bg = "white")
+
+```
 
 
 #### Plot Combat Sentrix ID-adjusted
@@ -260,6 +441,7 @@ for (pc in list(c(1,2), c(2,3), c(3,4), c(4,5))) {
   weeks_plt <- Plot2DPCA(meta=bat.pca_metadata, var=get_eigenvalue(bat.pca_res), color_by="stage_weeks", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkgreen", low="white")
   tri_plt <- Plot2DPCA(meta=bat.pca_metadata, var=get_eigenvalue(bat.pca_res), color_by="TRIMESTER", label_id="Sample_Name", pcs=pc) + scale_fill_manual(values=c("#FEE391", "#EC7014", "#662506"))
   bmi_plt <- Plot2DPCA(meta=bat.pca_metadata, var=get_eigenvalue(bat.pca_res), color_by="mat_bmi", label_id="Sample_Name", pcs=pc) + scale_fill_gradient(high="darkorange", low="white")
+  proc_plt <- Plot2DPCA(meta=bat.pca_metadata, var=get_eigenvalue(bat.pca_res), color_by="PROC_DATE", label_id="Sample_Name", pcs=pc)
   
   # Save
   dir.create(paste0(pca_dir, "comBat_sentrixID/"), recursive=TRUE)
@@ -271,6 +453,7 @@ for (pc in list(c(1,2), c(2,3), c(3,4), c(4,5))) {
   ggsave(paste0(pca_dir, "comBat_sentrixID/pca_biplot.qnt_norm.combatBatchAdj.pc",paste(pc, collapse=""),".colby_stageweeks.propprobes",prop_probes.by_var,".png"), weeks_plt, units="px", width=3000, height=3000)
   ggsave(paste0(pca_dir, "comBat_sentrixID/pca_biplot.qnt_norm.combatBatchAdj.pc",paste(pc, collapse=""),".colby_trimester.propprobes",prop_probes.by_var,".png"), tri_plt, units="px", width=3000, height=3000)
   ggsave(paste0(pca_dir, "comBat_sentrixID/pca_biplot.qnt_norm.combatBatchAdj.pc",paste(pc, collapse=""),".colby_bmi.propprobes",prop_probes.by_var,".png"), bmi_plt, units="px", width=3000, height=3000)
+  ggsave(paste0(pca_dir, "comBat_sentrixID/pca_biplot.qnt_norm.combatBatchAdj.pc",paste(pc, collapse=""),".colby_processDate.propprobes",prop_probes.by_var,".png"), proc_plt, units="px", width=3000, height=3000)
   
 }
 
@@ -319,133 +502,15 @@ for (pc in list(c(1,2), c(2,3), c(3,4), c(4,5))) {
 write.table(minfi::getM(qnt.mSetSqFlt), paste0(res_dir,"methylation_matrix.mvals.tsv"), sep="\t", quote=FALSE, row.names=TRUE, col.names=NA)
 write.table(minfi::getBeta(qnt.mSetSqFlt), paste0(res_dir,"methylation_matrix.betavals.tsv"), sep="\t", quote=FALSE, row.names=TRUE, col.names=NA)
 
+
+# Save methylation matrix for func normalisation
+write.table(minfi::getM(fun.mSetSqFlt), paste0(res_dir,"fun_methylation_matrix.mvals.tsv"), sep="\t", quote=FALSE, row.names=TRUE, col.names=NA)
+write.table(minfi::getBeta(fun.mSetSqFlt), paste0(res_dir,"fun_methylation_matrix.betavals.tsv"), sep="\t", quote=FALSE, row.names=TRUE, col.names=NA)
+
 # Save metadata with PCA
-write.table(qnt.pca_metadata, paste0(res_dir,"methylation_sample_metadata.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
+write.table(fun.pca_metadata, paste0(res_dir,"methylation_sample_metadata.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
 
 # Save annotation data
 write.table(as.data.frame(annotdata)[,1:24], paste0(res_dir,"methylation_probe_data.tsv"), sep="\t", quote=FALSE, row.names=FALSE)
-# as.data.frame(annotdata)[339601:339610,1:24]
-# as.data.frame(annotdata)[339603,1:24]
-
-```
-
-#### PVCA
-
-```{r}
-
-ProcessPVCA <- function(res, method_key, source_toggle=TRUE) {
-  
-  # Get as df
-  df <- data.frame(as.data.frame(res$label), t(as.data.frame(res$dat)), Method=method_key)
-  colnames(df) <- c("Effect", "Variance", "Method")
-  
-  # Return
-  return(df)
-}
-
-# Set threshold for variance explained to consider
-varexpl_thr <- 0.75
-
-# Expressionset data
-ordered_m <- minfi::getM(qnt.mSetSqFlt)[order(rowVars(minfi::getM(qnt.mSetSqFlt)), decreasing=TRUE),]
-expr_raw <- ExpressionSet(assayData = ordered_m[1:floor(nrow(ordered_m)*0.1),rownames(metadata)], 
-                          phenoData = new("AnnotatedDataFrame", data = metadata[,c("Batch","mat_bmi","mat_age","sex","stage_weeks")]))
-# expr_sva <- ExpressionSet(assayData = ordered_m[1:floor(nrow(ordered_m)*0.05),rownames(metadata)], 
-#                          phenoData = new("AnnotatedDataFrame", data = metadata[,c("Batch","mat_bmi","mat_age","sex","stage_weeks","SV1","SV2")]))
-
-# Run PVCA
-pvca_raw <- pvcaBatchAssess(abatch = expr_raw, batch.factors = c("Batch","sex","mat_bmi","mat_age","stage_weeks"), threshold = varexpl_thr)
-# pvca_sva <- pvcaBatchAssess(abatch = expr_sva, batch.factors = c("Batch","sex","stage_weeks","SV1","SV2"), threshold = varexpl_thr)
-
-# Process PVCA results
-pvca_raw.df <- ProcessPVCA(pvca_raw, method_key="Un-adjusted")
-# pvca_sva.df <- ProcessPVCA(pvca_sva, method_key="SVA")
-
-# Plot
-raw_plt <- ggplot(pvca_raw.df, aes(x=Effect, y=Variance)) + 
-  geom_bar(stat="identity", position="dodge", fill=lighten("darkblue", 0.5)) + 
-  xlab("") + ylab("Variance") + ylim(0,0.6) +
-  theme_bw(base_size=16) + theme(legend.position = "top",
-                                 axis.text.x = element_text(size=10, angle=90, hjust=1, vjust=0.5))
-# sva_plt <- ggplot(pvca_sva.df, aes(x=gsub("Z_","",Effect), y=Variance)) + 
-#   geom_bar(stat="identity", position="dodge", fill=lighten("darkblue", 0.5)) + 
-#   facet_grid(cols=vars(Type, Int_Type), space="free_x", scale="free_x") +
-#   xlab("") + ylab("Variance") + ylim(0,0.6) +
-#   theme_bw() + theme(axis.text.x=element_blank(), legend.position = "top")
-
-# Save
-ggsave(paste0(pca_dir, "pvca_plot.png"), raw_plt, units="px", width=3000, height=1500)
-
-```
-
-### Region of interest
-
-This attempts to see if the correlation between the CpGs at this loci is greater than the background.
-
-chr6:44,387,541 - 45,768,569
-
-```{r}
-
-# Get probe within region
-chr_annotdata <- annotdata[annotdata$chr == "chr6",]
-sub_annotdata <- data.frame(chr_annotdata[chr_annotdata$pos > 44387541 & chr_annotdata$pos < 45768569,])
-
-# Subset matrix
-sub_m <- minfi::getBeta(qnt.mSetSqFlt)[which(rownames(minfi::getBeta(qnt.mSetSqFlt)) %in% rownames(sub_annotdata)),]
-
-# Get mean per covariate
-for (group in unique(metadata$BMI_GROUP)) {
-  
-  # Get group
-  print(group)
-  sub_annotdata <- sub_annotdata[rownames(sub_m),]
-  sub_annotdata[[group]] <- unlist(rowMeans(sub_m[,as.character(metadata[metadata$BMI_GROUP == group,]$Sample_Name)]))
-
-}
-
-# Melt
-sub_annotdata["Probe"] <- rownames(sub_annotdata)
-tall.annotdata <- melt(sub_annotdata[,c("pos","chr","Relation_to_Island","Name",as.character(unique(metadata$BMI_GROUP)))], id.vars=c("pos","chr","Relation_to_Island","Name"))
-
-# Plot
-ggplot(sub_annotdata, aes(x=pos, y=rowMeans(sub_m)[rownames(sub_annotdata)], group=chr)) + 
-  geom_point() + 
-  # geom_hline(yintercept=background_mean.beta, linetype="dashed", color="blue") +
-  geom_hline(yintercept=0, linetype="dashed") +
-  xlab("Nucleotide position") + ylab("Mean % Methylated (Beta value)") +
-  theme_bw() + theme(legend.position="top")
-plt <- ggplot(tall.annotdata, aes(x=pos, y=value, fill=variable)) +
-  geom_point(shape=21) + 
-  scale_fill_manual(values=bmi_cols) +
-  facet_grid(rows=vars(variable)) +
-  # geom_hline(yintercept=background_mean.beta, linetype="dashed", color="blue") +
-  geom_hline(yintercept=0, linetype="dashed", color="darkgrey") +
-  xlab("Nucleotide position") + ylab("Mean % Methylated (Beta value)") +
-  theme_bw() + theme(legend.position="top")
-
-# Save
-ggsave(paste0(res_dir, "meanbeta_by_nt.splitbybmigroup.png"), plt, units="px", width=4000, height=2500)
-
-```
-
-### Wilcox tests
-
-```{r}
-
-for (bmi1 in unique(metadata$BMI_GROUP)) {
-  
-  for (bmi2 in unique(metadata$BMI_GROUP)) {
-   
-    if (bmi1 != bmi2) {
-      
-      wcx <- wilcox.test(tall.annotdata[tall.annotdata$variable == bmi1 & tall.annotdata$pos > 44800000 & tall.annotdata$pos < 45300000,]$value,
-                         tall.annotdata[tall.annotdata$variable == bmi1 & tall.annotdata$pos > 44800000 & tall.annotdata$pos < 45300000,]$value)
-      print(paste0(bmi1," vs ", bmi2, " p = ",wcx$p.value))
-      
-    } 
-    
-  }
-  
-}
 
 ```

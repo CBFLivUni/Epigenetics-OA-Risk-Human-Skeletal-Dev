@@ -1,8 +1,8 @@
 
-ReadInOverlapDMRs <- function(featursOfInterest, dmrSet, in_dir="./") {
+ReadInOverlapDMRs <- function(featuresOfInterest, dmrSet, in_dir="./") {
   
   # Loop over ids and read in overlapped feature sets
-  ovlps <- lapply(featursOfInterest, function(feat) { 
+  ovlps <- lapply(featuresOfInterest, function(feat) { 
     
     # Read in
     print(feat)
@@ -35,12 +35,11 @@ ReadInOverlapDMRs <- function(featursOfInterest, dmrSet, in_dir="./") {
   
 }
 
-
-CalcFreqFeatures <- function(df, set) {
+CalcFreqFeatures <- function(df, set, cols="FEATURE") {
   
   # Get background frequencies
-  out_df <- data.frame(table(df$FEATURE))
-  colnames(out_df) <- c("Feature","Count")
+  out_df <- data.frame(table(df[,cols]))
+  colnames(out_df) <- c(cols,"Count")
   
   # Add proportions
   out_df["Prop"] <- out_df$Count / sum(out_df$Count)
@@ -51,6 +50,7 @@ CalcFreqFeatures <- function(df, set) {
   # Return
   return(out_df)
 }
+
 
 CalcFeatureWidths <- function(df, set, startCol="V2", endCol="V3") {
   
@@ -110,12 +110,14 @@ FeatureWiseFishers <- function(inDF, testFeature, backFeature, maxItems, ...) {
   # Dependencies
   require(broom)
   
+  browser()
+  
   # Split to test/background
   ovlpTestData <- inDF[inDF$Set == testFeature,]
   ovlpBackData <- inDF[inDF$Set == backFeature,]
   
   # Get common features
-  commonFeatures <- intersect(ovlpTestData$Feature, ovlpBackData$Feature)
+  commonFeatures <- intersect(ovlpTestData$FEATURE, ovlpBackData$FEATURE)
   
   # Loop over features and run tests
   allFishDF <- do.call("rbind",lapply(commonFeatures, function(feature) {
@@ -124,8 +126,8 @@ FeatureWiseFishers <- function(inDF, testFeature, backFeature, maxItems, ...) {
     print(feature)
     
     # Subset
-    subOvlpBackData <- ovlpBackData[ovlpBackData$Feature == feature,]
-    subOvlpTestData <- ovlpTestData[ovlpTestData$Feature == feature,]
+    subOvlpBackData <- ovlpBackData[ovlpBackData$FEATURE == feature,]
+    subOvlpTestData <- ovlpTestData[ovlpTestData$FEATURE == feature,]
     
     # If we want to look for number of features
     testM <- rbind(cbind(subOvlpBackData$Count, sum(ovlpBackData$Count) - subOvlpBackData$Count),
@@ -157,5 +159,33 @@ FeatureWiseFishers <- function(inDF, testFeature, backFeature, maxItems, ...) {
   
   # Return
   return(allFishDF)
+  
+}
+
+
+PlotDMROverlapProportions <- function(df, fileNamePrefix, colPal, outDir="./") {
+  
+  # Properly order
+  df$Set <- factor(df$Set, levels=rev(c("All Sig DMRs", "Up Sig DMRs", "Down Sig DMRs", "Genome")))
+  
+  # Plot
+  DMR_plt <- ggplot(df, aes(y=Set, x=Prop, fill=FEATURE)) + 
+    geom_bar(stat="identity", color="black") +
+    scale_fill_manual(values=colPal) +
+    ylab("") + xlab("Proportion of States") +
+    ggtitle("Developmental Stage DMRs") +
+    theme_minimal(base_size=20) + theme(plot.title=element_text(size=36),
+                                        axis.title=element_text(size=32),
+                                        legend.text=element_text(size=16),
+                                        legend.title=element_blank(),
+                                        panel.grid.major.y = element_blank() ,
+                                        panel.grid.major.x = element_line( size=.1, color="darkgrey" ))
+  
+  # Save
+  ggsave(here(outDir, paste0(fileNamePrefix, "_freqBarPlot.png")), DMR_plt, width=4000, height=2000, units="px", device="png",bg="white")
+  ggsave(here(outDir, paste0(fileNamePrefix, "_freqBarPlot.pdf")), DMR_plt, width=4000, height=2000, units="px", device="pdf",bg="white")
+  
+  # Return
+  return(DMR_plt)
   
 }

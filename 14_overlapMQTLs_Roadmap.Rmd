@@ -1,0 +1,279 @@
+---
+title: "ROADMAP"
+author: "Euan McDonnell and Jamie Soul"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## Code
+
+### Libraries
+
+```{r}
+
+library(ggplot2)
+library(RColorBrewer)
+library(stringr)
+library(reticulate)
+library(GenomicRanges)
+library(reshape2)
+
+```
+
+### Define Directories
+
+```{r}
+
+# Define directories
+main_dir <- getwd()
+data_dir <- paste0(main_dir, "/rawdata/")
+res_dir <- paste0(main_dir, "/results/")
+pca_dir <- paste0(main_dir, "/pca/")
+dmr_dir <- paste0(res_dir, "dmr/")
+roadmap_dir <- paste0(dmr_dir, "/ROADMAPstates/")
+de_dir <- paste0(main_dir, "/differential_methylation/")
+util_dir <- paste0(main_dir, "/utilities/")
+log_dir <- paste0(main_dir, "/logs/")
+
+```
+
+### Source R scripts
+
+```{r}
+
+# Source script that sources files
+source("install/source_rscripts.R")
+
+# Source relevant scripts
+SourceExternalScripts(paste0(util_dir, "R/"), "*.R$", ignore.case=FALSE)
+
+```
+
+### Define the roadmap features
+
+```{r}
+
+#Set up a key of higher level to finer level feature names
+
+# Set features
+features <- c("Tss", "TssFlank", "Enhancer", "Transcribed", "Repressed")
+
+# Check these match
+feature_codes <- list(
+                      c("TssA","TssBiv"),
+                      c("TssAFlnk","BivFlnk"),
+                      c("Enh","EnhG","EnhBiv"),
+                      c("TxWk","Tx","TxFlnk"),
+                      c("Quies","ReprPCWk","ReprPC","Het","ZNF/Rpts")
+)
+
+names(feature_codes) <- features
+
+```
+
+### Read in the group 15 ROADMAP states
+
+```{r}
+
+# Read in ROADMAP states bed file
+roadmap <- read.table(paste0(roadmap_dir, "E049_15_coreMarks_dense.bed"), sep="\t", header=FALSE, skip=1)
+roadmap$V4 <- gsub("[0-9][0-9]*_","",roadmap$V4)
+
+```
+
+### Read in the mqtl datasets
+
+```{r}
+#read in the mqtl data (FDR filtered)
+mqtls <- read.delim("mqtl/mqtl_analysis.cis_mqtls.genomewide.tsv")
+
+
+#get the colocalised mqtls
+coloc <- read.delim("mqtl/coloc/mqtl_coloc_annotated.tsv")
+
+#filter coloc by FDR to match the mqtl filtering
+coloc <- coloc[ coloc$mQTL_FDR <= 0.05,]
+
+```
+
+
+#### Convert the features to genomic ranges
+```{r}
+colnames(roadmap)[1:4] <- c("chr","start","end","feature")
+roadmap <- makeGRangesFromDataFrame(roadmap,keep.extra.columns = TRUE,starts.in.df.are.0based = TRUE)
+
+#add the broad features
+feature_codes <- stack(feature_codes)
+colnames(feature_codes) <- c("Fine","Broad")
+roadmap$broadFeature <- feature_codes[match(roadmap$feature,feature_codes$Fine),"Broad"]
+
+
+coloc$CpGChr <- word(coloc$CpG_Location,1,sep=":")
+coloc$CpGPos <- word(coloc$CpG_Location,2,sep=":")
+
+#unique colocalised CpGs
+coloc <- coloc[!duplicated(coloc$CpG),]
+coloc_df <- data.frame(chr=coloc$CpGChr,start=as.numeric(coloc$CpGPos),end=as.numeric(coloc$CpGPos),CpG=coloc$CpG,gene=coloc$CpG_NearestGene)
+coloc_gr <- makeGRangesFromDataFrame(coloc_df,keep.extra.columns = TRUE)
+
+#unique all sig mqtl CpGs
+mqtls <- mqtls[!duplicated(mqtls$gene),]
+mqtls_df <- data.frame(chr=mqtls$CpG_chr,start=mqtls$CpG_position,end=mqtls$CpG_position)
+mqtls_gr <- makeGRangesFromDataFrame(mqtls_df,keep.extra.columns = TRUE)
+
+```
+
+### Overlap the mqtls
+
+```{r}
+#function to get the total number of overlaps
+getFeatureOverlapCount <- function(feature,roadmap,query){
+  
+  #get the feature specific gr
+  roadmap_feature <- roadmap[roadmap$broadFeature==feature,]
+  
+  #get the overlap size
+  overlap <- sum(countOverlaps(query,roadmap_feature))
+  
+  
+  return(overlap)
+         
+}
+
+
+#function to get the overlapping CpGs for a given feature
+getFeatureOverlaps <- function(feature,roadmap,query){
+  
+  #get the feature specific gr
+  roadmap_feature <- roadmap[roadmap$broadFeature==feature,]
+  
+  #get the overlaps
+  overlappingCpGs <- findOverlaps(query,roadmap_feature)
+  
+  #get the overlaping CpGs
+  overlappingCpGs <- coloc_gr[queryHits(overlappingCpGs),]  
+  
+  overlappingCpGs$Feature <- feature
+  
+  return(overlappingCpGs)
+         
+}
+
+#get the number of overlaps for each roadmap feature
+mqtlOverlap <- sapply(unique(feature_codes$Broad),getFeatureOverlapCount,roadmap,mqtls_gr)
+colocOverlap <- sapply(unique(feature_codes$Broad),getFeatureOverlapCount,roadmap,coloc_gr)
+
+
+#what is overlapping?
+overlapColoc <-  sapply(unique(feature_codes$Broad),getFeatureOverlaps,roadmap,coloc_gr)
+
+#make into a summary table
+featureTable <- data.frame(feature=unique(feature_codes$Broad),
+                           colocOverlap=colocOverlap,mqtlOverlap=mqtlOverlap,
+                           colocSize=nrow(coloc),
+                           mqtlSize=nrow(mqtls))
+
+  
+  # function to calculate Fisher's exact test and fold enrichment for a row
+  calculate_row <- function(row) {
+    # Convert row elements to numeric where needed
+    colocOverlap <- as.numeric(row["colocOverlap"])
+    mqtlOverlap <- as.numeric(row["mqtlOverlap"])
+    colocSize <- as.numeric(row["colocSize"])
+    mqtlSize <- as.numeric(row["mqtlSize"])
+    
+    # Create the contingency table
+    matrix <- matrix(c(
+      colocOverlap, mqtlOverlap - colocOverlap,
+      colocSize - colocOverlap, mqtlSize - mqtlOverlap
+    ), nrow = 2, byrow = TRUE)
+    
+    # Perform Fisher's exact test
+    fisher_result <- fisher.test(matrix)
+    
+    # Calculate fold enrichment
+    observed_overlap <- colocOverlap
+    
+    #if the coloc size was the same size as the sig mqtls what would the overlap expected to be?
+    expected_overlap <- (colocSize * mqtlOverlap) / mqtlSize
+    fold_enrichment <- observed_overlap / expected_overlap
+    
+    # Return the result as a list
+    return(c(feature = row["feature"], 
+             colocOverlap = colocOverlap, 
+             mqtlOverlap = mqtlOverlap,
+             colocSize = colocSize,
+             mqtlSize = mqtlSize,
+             fold_enrichment = fold_enrichment, 
+             pvalue = fisher_result$p.value))
+  }
+  
+#function to get enrichment for each feature
+calculate_enrichment <- function(data) {
+
+  # get enrichment for each row
+  results <- t(apply(data, 1, calculate_row))
+  results_df <- as.data.frame(results)
+  
+  # convert numeric columns back to numeric if there an
+  results_df$colocOverlap <- as.numeric(results_df$colocOverlap)
+  results_df$mqtlOverlap <- as.numeric(results_df$mqtlOverlap)
+  results_df$colocSize <- as.numeric(results_df$colocSize)
+  results_df$mqtlSize <-as.numeric(results_df$mqtlSize)
+  results_df$fold_enrichment <- as.numeric(results_df$fold_enrichment)
+  results_df$pvalue <- as.numeric(results_df$pvalue)
+  
+  colnames(results_df)[1] <- "feature"
+  return(results_df)
+}
+
+
+
+featureTable <- calculate_enrichment(featureTable)
+
+write.table(featureTable, "mqtl/mqtlColoc_ROADMAP_overlap_fishersExactTest.txt", sep="\t", quote=FALSE,row.names = FALSE,col.names = TRUE)
+
+
+
+
+```
+
+
+#### Plot
+
+```{r}
+# Plot
+featureTable$colocProportion <- featureTable$colocOverlap / featureTable$colocSize
+featureTable$mqtlProportion <- featureTable$mqtlOverlap / featureTable$mqtlSize
+
+# Define colours
+feat_colors <- c("#FF0100", "#DD7095", "#FED800", "#008D00", "#BFBFBF")
+names(feat_colors) <- str_to_title(gsub("tss","TSS",features))
+
+featureTable$Feature <- str_to_title(gsub("Tss","TSS",featureTable$feature))
+
+
+# Reshape data for plotting
+plot_data <- reshape2::melt(featureTable, id.vars = "Feature", measure.vars = c("colocProportion", "mqtlProportion"),
+                  variable.name = "Type", value.name = "Proportion")
+
+# Rename Type values for better readability
+plot_data$Set <- factor(plot_data$Type, levels = c("colocProportion", "mqtlProportion"), labels = c("CpGs in Colocalised mQTLs", "CpGs in mQTLs"))
+
+
+
+dDMR_plt <- ggplot(plot_data, aes(y=Set, x=Proportion, fill=Feature)) + 
+                   geom_bar(stat="identity", color="black") +
+                   scale_fill_manual(values=feat_colors) +
+                   ylab("") + xlab("Proportion of States") +
+                   theme_minimal(base_size=20) + theme(plot.title=element_text(size=36),
+                                                       axis.title=element_text(size=32),
+                                                       legend.text=element_text(size=16),
+                                                       panel.grid.major.y = element_blank() ,
+                                                       panel.grid.major.x = element_line( size=.1, color="darkgrey" ) ) 
+
+# Save
+ggsave("mqtl/mqtlColocOverlap_ROADMAPfeatures_freqBarPlot.pdf", dDMR_plt, width=4000, height=2000, units="px", device="pdf",bg="white")
+
+
+```

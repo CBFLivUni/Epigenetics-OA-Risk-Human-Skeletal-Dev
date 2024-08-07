@@ -1,6 +1,5 @@
 ---
 title: "matrixQTL preparation"
-output: html_notebook
 ---
 
 
@@ -11,6 +10,8 @@ output: html_notebook
 library(rtracklayer)
 library(dplyr)
 library(stringr)
+library(PCAForQTL)
+
 ```
 
 
@@ -51,8 +52,13 @@ imput_data.df <- imput_data.df[,colnames(imput_data.df) != "X15213"]
 ```{r}
 
 # Read in methylation data
-meth_m <- read.table(paste0(res_dir,"methylation_matrix.mvals.tsv"), sep="\t", header=TRUE)
-meth_beta <- read.table(paste0(res_dir,"methylation_matrix.betavals.tsv"), sep="\t", header=TRUE)
+meth_m <- read.table(paste0(res_dir,"fun_methylation_matrix.mvals.tsv"), sep="\t", header=TRUE)
+
+meth_m <- meth_m[apply(meth_m[,-1], 1, function(row) all(!is.na(row)) & all(is.finite(row))),]
+
+
+
+meth_beta <- read.table(paste0(res_dir,"fun_methylation_matrix.betavals.tsv"), sep="\t", header=TRUE)
 colnames(meth_m) <- gsub("^X","",colnames(meth_m)); colnames(meth_m)[[1]] <- "id"
 colnames(meth_beta) <- gsub("^X","",colnames(meth_beta)); colnames(meth_beta)[[1]] <- "id"
 
@@ -61,13 +67,49 @@ meth_annot.df <- read.table(paste0(res_dir,"methylation_probe_data.tsv"), sep="\
 meth_annot.df <- meth_annot.df[which(meth_annot.df$Name %in% meth_m$id),]
  
 ```
+## Get the methylation PCs
+
+Use PCAForQTL to optimise the number of PCs to include
+```{r}
+prcompResult<-prcomp(t(meth_m[,-1]),center=TRUE,scale.=TRUE)
+PCs<-prcompResult$x
+
+#select the number of PCs to include
+resultRunElbow<-PCAForQTL::runElbow(prcompResult=prcompResult)
+print(resultRunElbow)
+
+#plot the elbow plot
+K_elbow<-resultRunElbow
+screePlot <- PCAForQTL::makeScreePlot(prcompResult,labels="Elbow",values=K_elbow) +
+  ylab("Proportion Variance Explained")
+
+ggsave(paste0(de_dir,"methylationPCA_elbowPlot.png"), screePlot, units="in", width=5, height=4, bg = "white")
+
+ggsave("figures/SuppFig_methylationPCA_elbowPlot.pdf", screePlot, units="in", width=5, height=4, bg = "white")
+
+
+knownCovariates <- metadata[,c("Batch", "sex", "stage_weeks")]
+rownames(knownCovariates) <- metadata$Sample_Name
+knownCovariates$Batch <- as.numeric(as.factor(knownCovariates$Batch))
+knownCovariates$sex <- as.numeric(as.factor(knownCovariates$sex))
+
+#check the order of the columns
+all(rownames(knownCovariates) == colnames(meth_m)[-1])
+
+
+PCsTop<-PCs[,1:K_elbow]
+PCsTop <- scale(PCsTop)
+colnames(PCsTop) <- paste0("methylation",colnames(PCsTop) )
+
+#filter the PCs by known covariates
+knownCovariatesFiltered<-PCAForQTL::filterKnownCovariates(knownCovariates,PCsTop,unadjustedR2_cutoff=0.9)
+```
 
 ### get the data for GWAS coloc
 
 ```{r}
 #read in the gwas use all phenotypes
 regions <- read.delim(paste0(mqtl_dir,"gwasRegions.txt"))
-# regions <- regions[ grepl("AllOA|KneeOA|TJR|FingerOA|HandOA|ThumbOA|HipOA|KneeHipOA|TKR|THR",regions$Osteoarthritis.phenotype)|grepl("AllOA|KneeOA|TJR|FingerOA|HandOA|ThumbOA|HipOA|KneeHipOA|TKR|THR",regions$Other.osteoarthritis.phenotypes),]
 
 #function to return the SNP IDs near the signal snps
 getNearbySNPs <- function(region,snpLocs){
@@ -137,13 +179,14 @@ write.table(coloc.snps.df, paste0(mqtl_dir,"snp_matrix.for_mqtl.coloc.tsv"), sep
 
 #read in the pca data
 pcaDat <- read.delim("results/genotyping_pca_metadata.tsv")
-pcaDat <- pcaDat[ pcaDat$Superpopulation=="CurrentStudy",c("SampleID","PC1","PC2","PC3","PC4")]
+pcaDat <- pcaDat[ pcaDat$Superpopulation=="CurrentStudy",c("SampleID","PC1","PC2","PC3","PC4","PC5")]
 
 
 
-saveCovariates <- function(numPC=0, metadata,pcaDat) {
-
-  cov_data <- metadata[,c("Sample_Name","Batch", "sex", "stage_weeks")]
+saveCovariates <- function(numPC=0, metadata,pcaDat, methylationPCA) {
+  
+  #removing stage_weeks as strongly associated with the first PC
+  cov_data <- metadata[,c("Sample_Name","Batch", "sex")]
   cov_data$Sample_Name <- gsub("X","",cov_data$Sample_Name)
   
   if(numPC>0){
@@ -158,13 +201,15 @@ saveCovariates <- function(numPC=0, metadata,pcaDat) {
   cov_data <- t(cov_data); colnames(cov_data) <- metadata$Sample_Name
   cov_data["Batch",] <- as.numeric(as.factor(cov_data["Batch",]))
   cov_data["sex",] <- as.numeric(as.factor(cov_data["sex",]))
+  cov_data <- rbind(cov_data, t(methylationPCA))
   
   write.table(cov_data, sprintf("%scovariates.for_mqtl_numPC%s.tsv",mqtl_dir,numPC), sep="\t", quote=FALSE, col.names=NA)
 
 }
 
-numPCs <- 0:4
-savedFiles <- sapply(numPCs,saveCovariates,metadata,pcaDat)
+numPCs <- 0:5
+savedFiles <- sapply(numPCs,saveCovariates,metadata,pcaDat,PCsTop)
+
 
 
 # Get position file

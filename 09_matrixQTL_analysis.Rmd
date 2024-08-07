@@ -170,7 +170,7 @@ tunePCs <- FALSE
 
 if(tunePCs) {
 
-covariateFiles <- sprintf("%scovariates.for_mqtl_numPC%s.tsv",mqtl_dir,0:4)
+covariateFiles <- sprintf("%scovariates.for_mqtl_numPC%s.tsv",mqtl_dir,0:5)
 
 results <- lapply(covariateFiles,run_mqtlAnalysis,snps,gene,output_file_name,useModel,
                              errorCovariance,output_file_name_cis,pvOutputThreshold,snppos=imp.snp_loc.df,methpos=imp.meth_loc.df,cisDist)
@@ -180,7 +180,7 @@ results <- lapply(covariateFiles,run_mqtlAnalysis,snps,gene,output_file_name,use
 
 ```
 
-Two PCs in the covariate matrix maximises the number of sig mQTLs
+5 PCs in the covariate matrix is used based on the ancestry PC plot
 ```{r}
 
     ## Load covariates
@@ -191,7 +191,7 @@ Two PCs in the covariate matrix maximises the number of sig mQTLs
   cvrt$fileSkipColumns = 1;       # one column of row labels
   
   # Get as files
-  cvrt$LoadFile("mqtl/covariates.for_mqtl_numPC2.tsv");
+  cvrt$LoadFile("mqtl/covariates.for_mqtl_numPC5.tsv");
   
   ## Outliers removed
   all.dist.me <- Matrix_eQTL_main(snps = snps,
@@ -201,7 +201,7 @@ Two PCs in the covariate matrix maximises the number of sig mQTLs
                              useModel = useModel,
                              errorCovariance = errorCovariance,
                              verbose = FALSE,
-                             output_file_name.cis = "mQTL_results_numPC2_ciswithFDR.txt",
+                             output_file_name.cis = "mQTL_results_numPC5_ciswithFDR.txt",
                              pvOutputThreshold.cis = pvOutputThreshold,
                              snpspos = imp.snp_loc.df,
                              genepos = imp.meth_loc.df,
@@ -223,7 +223,7 @@ snps$fileDelimiter = "\t";      # the TAB character
 snps$fileOmitCharacters = "NA"; # denote missing values;
 snps$fileSkipRows = 1;          # one row of column labels
 snps$fileSkipColumns = 1;       # one column of row labels
-snps$fileSliceSize = 2000;      # read file in slices of 2,000 rows
+snps$fileSliceSize = 10000;      # read file in slices of 2,000 rows
 
 # Get as files
 snps$LoadFile(coloc.SNP_file_name);
@@ -244,7 +244,7 @@ coloc.dist.me = Matrix_eQTL_main(snps = snps,
                            useModel = useModel,
                            errorCovariance = errorCovariance,
                            verbose = FALSE,
-                           output_file_name.cis = "mQTL_results_numPC4_coloc.txt",
+                           output_file_name.cis = "mQTL_results_numPC5_coloc.txt",
                            pvOutputThreshold.cis = 1,
                            snpspos = imp.snp_loc.df,
                            genepos = imp.meth_loc.df,
